@@ -347,6 +347,7 @@ Il faut au moins 30 à 50 décisions pour que ces statistiques veuillent dire qu
 | `app.py` | Interface Streamlit |
 | `tests/` | Tests hors ligne (données synthétiques, client Claude simulé, réseau bloqué) |
 | `tests/integration/` | Vérifications des vrais fournisseurs et de l'API Claude |
+| `tests/app_harness.py` | Interface lancée avec données et modèle simulés (`streamlit run tests/app_harness.py`) |
 
 Ajouter un agent : créer un `AgentSpec` dans `agents.py`, l'ajouter à `SPECIALISTS`, ajouter
 sa clé dans `AgentView.agent`, et lui préparer un briefing dans `Context.briefing`.

@@ -6,3 +6,4 @@ __pycache__/
 .streamlit/secrets.toml
 teamtrader_history.db
 *.avant-restauration
+harness.db

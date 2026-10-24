@@ -107,8 +107,8 @@ class Outcome:
 # ------------------------------------------------------------------ stockage
 
 
-def connect(path: str = config.HISTORY_DB) -> sqlite3.Connection:
-    con = sqlite3.connect(path)
+def connect(path: Optional[str] = None) -> sqlite3.Connection:
+    con = sqlite3.connect(path or config.HISTORY_DB)
     con.execute(SCHEMA)
     columns = {row[1] for row in con.execute("PRAGMA table_info(decisions)")}
     for name, ddl in MIGRATIONS.items():

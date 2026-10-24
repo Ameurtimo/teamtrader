@@ -122,7 +122,7 @@ def smc_chart(df: pd.DataFrame, m: smc.SMCMap, title: str):
     return fig
 
 
-def render_smc(m: smc.SMCMap, df: pd.DataFrame, asset_name: str):
+def render_smc(m: smc.SMCMap, df: pd.DataFrame, asset_name: str, key: str):
     s = m.setup
     color = "#dc2626" if s.status.startswith("invalidé") else SETUP_COLOR[s.entry_allowed]
     verdict = "ENTRÉE VALIDE" if s.entry_allowed else "PAS D'ENTRÉE"
@@ -146,7 +146,9 @@ def render_smc(m: smc.SMCMap, df: pd.DataFrame, asset_name: str):
     c[4].metric("Objectifs", " / ".join(f"{t:,.0f}" for t in s.targets) or "—")
     for n in s.notes:
         st.markdown(f"- {n}")
-    st.plotly_chart(smc_chart(df, m, f"{asset_name} — SMC {m.timeframe}"), width="stretch")
+    # Clé explicite : le même graphique peut apparaître dans l'analyse et dans le scanner.
+    st.plotly_chart(smc_chart(df, m, f"{asset_name} — SMC {m.timeframe}"), width="stretch",
+                    key=f"smc_chart_{key}")
     with st.expander("Cartographie complète"):
         st.code(smc.format_map(m), language=None)
 
@@ -174,7 +176,7 @@ def render_smc_scanner(asset_key: str, style_label: str):
         st.error(f"Impossible de récupérer les prix : {error}")
         return
     m, df, source = result
-    render_smc(m, df, ASSETS[asset_key].name)
+    render_smc(m, df, ASSETS[asset_key].name, key="scanner")
     st.caption(f"Source des prix : {source}")
 
 
@@ -704,6 +706,7 @@ def render_history():
                 help="Gains / pertes en R ; drawdown = pire baisse de la courbe en R")
     if stats["courbe"]:
         st.plotly_chart(r_curve_chart(stats["courbe"], "Courbe de résultats cumulés", "R"),
+                        key="history_curve",
                         width="stretch")
     if stats["ambigus"]:
         st.caption(f"⚠️ {stats['ambigus']} décision(s) avec une ambiguïté de rejeu (détail dans "
@@ -927,6 +930,7 @@ def render_paper():
     c[4].metric("Drawdown max", fmt(perf["drawdown_max_pct"], "{:.1f} %"))
     if perf["courbe"]:
         st.plotly_chart(r_curve_chart(perf["courbe"], "Courbe de capital (net de coûts)", "$"),
+                        key="paper_curve",
                         width="stretch")
     if closed:
         st.dataframe([{
@@ -1071,11 +1075,12 @@ with tab_analysis:
         fig = price_chart(ctx)
         add_levels(fig, result.decision)
         render_decision(ctx, result, record_id)
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, width="stretch", key="analysis_chart")
         st.caption(f"Source des prix : {ctx.source}")
         if ctx.smc_map:
             st.subheader("🎯 Lecture Smart Money")
-            render_smc(ctx.smc_map, ctx.frames[ctx.smc_map.timeframe], ctx.asset.name)
+            render_smc(ctx.smc_map, ctx.frames[ctx.smc_map.timeframe], ctx.asset.name,
+                       key="analyse")
         st.subheader("Rapports détaillés")
         order = {s.key: i for i, s in enumerate(agents.DECISION_AGENTS)}
         for r in sorted(reports, key=lambda r: order.get(r.key, 99)):

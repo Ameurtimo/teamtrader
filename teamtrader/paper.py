@@ -88,8 +88,8 @@ class Position:
         return risk.OpenRisk(self.asset, self.long, self.units, self.entry, self.stop, self.margin)
 
 
-def connect(path: str = config.HISTORY_DB) -> sqlite3.Connection:
-    con = sqlite3.connect(path)
+def connect(path: Optional[str] = None) -> sqlite3.Connection:
+    con = sqlite3.connect(path or config.HISTORY_DB)
     con.execute(SCHEMA)
     return con
 
