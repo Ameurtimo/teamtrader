@@ -12,20 +12,25 @@ class Asset:
     name: str
     yahoo: str
     description: str
+    # Symbole spot chez Twelve Data (utilisé si TWELVEDATA_API_KEY est défini).
+    twelvedata: str = ""
+    # Yahoo ne cote que le future pour l'or : on le recale sur le spot.
+    spot_adjust: bool = False
 
 
 ASSETS: dict[str, Asset] = {
     "XAUUSD": Asset(
         key="XAUUSD",
         name="Or (XAU/USD)",
-        # Le spot XAU/USD n'est pas fiable sur Yahoo : on utilise le future COMEX,
-        # qui suit le spot à quelques dollars près (prime de portage).
+        # Sans clé Twelve Data, on part du future COMEX (Yahoo) recalé sur le spot.
         yahoo="GC=F",
         description=(
             "Or physique coté en dollars. Valeur refuge, sensible au dollar (DXY), "
             "aux taux réels US, à la politique de la Fed, aux achats des banques "
             "centrales, aux flux ETF et aux tensions géopolitiques."
         ),
+        twelvedata="XAU/USD",
+        spot_adjust=True,
     ),
     "BTCUSD": Asset(
         key="BTCUSD",
@@ -36,6 +41,7 @@ ASSETS: dict[str, Asset] = {
             "liquidité mondiale, à l'appétit pour le risque (Nasdaq), aux flux des ETF "
             "spot, à la régulation, au cycle de halving et aux données on-chain."
         ),
+        twelvedata="BTC/USD",
     ),
 }
 
@@ -60,11 +66,23 @@ TRADING_STYLES: dict[str, str] = {
     "Position (quelques semaines)": "trading de position, tenue de 2 à 8 semaines",
 }
 
+# Durée de vie maximale d'une décision (en heures) pour l'évaluer dans l'historique.
+STYLE_MAX_HOURS: dict[str, int] = {
+    "Intraday (quelques heures)": 24,
+    "Swing (quelques jours)": 10 * 24,
+    "Position (quelques semaines)": 8 * 7 * 24,
+}
+
 MODEL = os.environ.get("TEAMTRADER_MODEL", "claude-opus-5-5")
 
 # Effort de réflexion : les spécialistes travaillent vite, le décideur réfléchit plus.
 SPECIALIST_EFFORT = os.environ.get("TEAMTRADER_SPECIALIST_EFFORT", "medium")
 DECISION_EFFORT = os.environ.get("TEAMTRADER_DECISION_EFFORT", "high")
+
+TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "")
+
+# Journal des décisions (SQLite).
+HISTORY_DB = os.environ.get("TEAMTRADER_DB", "teamtrader_history.db")
 
 # Nombre maximum de recherches web par agent.
 WEB_SEARCH_MAX_USES = int(os.environ.get("TEAMTRADER_WEB_SEARCH_MAX_USES", "6"))

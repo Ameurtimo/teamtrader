@@ -181,8 +181,11 @@ def test_briefings_are_specialised():
     h = make_ohlcv()
     ctx = pipeline.Context(
         asset=ASSETS["BTCUSD"], style="swing", frames={"1h": h, "4h": data.resample(h, "4h")},
-        price=100.0, technical="INDICATEURS", macro="TABLEAU_MACRO",
+        price=100.0, technical="INDICATEURS", macro="TABLEAU_MACRO", sentiment="SENTI",
     )
+    assert [s.key for s in agents.SPECIALISTS] == [
+        "fondamental", "technique", "geopolitique", "sentiment"]
+    assert "SENTI" in ctx.briefing("sentiment")
     assert "INDICATEURS" in ctx.briefing("technique")
     assert "TABLEAU_MACRO" in ctx.briefing("fondamental")
     geo = ctx.briefing("geopolitique")

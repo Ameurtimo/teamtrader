@@ -1,4 +1,4 @@
-"""Orchestration : données → 3 spécialistes en parallèle → décision du chef de desk."""
+"""Orchestration : données → 4 spécialistes en parallèle → décision du chef de desk."""
 
 from __future__ import annotations
 
@@ -22,6 +22,8 @@ class Context:
     price: float
     technical: str
     macro: str
+    sentiment: str = ""
+    source: str = ""
     notes: str = ""
 
     def briefing(self, agent_key: str) -> str:
@@ -30,7 +32,7 @@ class Context:
             f"Date et heure : {now}\n"
             f"Actif : {self.asset.name}\n"
             f"Contexte : {self.asset.description}\n"
-            f"Prix actuel : {self.price:.2f}\n"
+            f"Prix actuel : {self.price:.2f} (source : {self.source or 'n/d'})\n"
             f"Style de trading du desk : {self.style}\n"
         )
         if self.notes.strip():
@@ -52,12 +54,20 @@ class Context:
                 + self.macro
                 + "\n\nRédige ton analyse fondamentale et macro."
             )
+        if agent_key == "sentiment":
+            return (
+                head
+                + "\n## Données de sentiment disponibles\n\n"
+                + self.sentiment
+                + "\n\nRédige ton analyse du sentiment et du positionnement."
+            )
         return head + "\nRédige ton analyse géopolitique et d'actualité."
 
 
 def prepare(asset_key: str, style: str, notes: str = "") -> Context:
     asset = ASSETS[asset_key]
-    frames = data.get_price_history(asset)
+    prices = data.get_price_history(asset)
+    frames = prices.frames
     return Context(
         asset=asset,
         style=style,
@@ -65,6 +75,8 @@ def prepare(asset_key: str, style: str, notes: str = "") -> Context:
         price=float(frames["1h"]["Close"].iloc[-1]),
         technical=indicators.format_technical(frames),
         macro=data.format_macro(data.macro_snapshot()),
+        sentiment=data.sentiment_snapshot(asset, frames),
+        source=prices.source,
         notes=notes,
     )
 
@@ -72,7 +84,7 @@ def prepare(asset_key: str, style: str, notes: str = "") -> Context:
 def run_specialists(
     client: anthropic.Anthropic, ctx: Context, model: str = config.MODEL
 ) -> Iterator[agents.AgentReport]:
-    """Lance les trois analystes en parallèle et renvoie chaque rapport dès qu'il arrive."""
+    """Lance les analystes en parallèle et renvoie chaque rapport dès qu'il arrive."""
     with ThreadPoolExecutor(max_workers=len(agents.SPECIALISTS)) as pool:
         futures = [
             pool.submit(agents.run_specialist, client, spec, ctx.briefing(spec.key), model)

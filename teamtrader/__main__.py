@@ -6,24 +6,25 @@ import argparse
 
 import anthropic
 
-from . import pipeline
+from . import history, pipeline
 from .config import ASSETS, TRADING_STYLES
 
-STYLE_ALIASES = dict(zip(("intraday", "swing", "position"), TRADING_STYLES.values()))
+STYLE_LABELS = dict(zip(("intraday", "swing", "position"), TRADING_STYLES))
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description="TeamTrader — décision de trading multi-agents")
     p.add_argument("asset", choices=list(ASSETS))
-    p.add_argument("--style", choices=list(STYLE_ALIASES), default="swing")
+    p.add_argument("--style", choices=list(STYLE_LABELS), default="swing")
     p.add_argument("--notes", default="")
     p.add_argument("--verbose", "-v", action="store_true", help="Affiche les rapports complets")
     args = p.parse_args()
 
     client = anthropic.Anthropic()
     print(f"Récupération des données pour {ASSETS[args.asset].name}…")
-    ctx = pipeline.prepare(args.asset, STYLE_ALIASES[args.style], args.notes)
-    print(f"Prix actuel : {ctx.price:.2f}\n")
+    style = STYLE_LABELS[args.style]
+    ctx = pipeline.prepare(args.asset, TRADING_STYLES[style], args.notes)
+    print(f"Prix actuel : {ctx.price:.2f} ({ctx.source})\n")
 
     reports = []
     for r in pipeline.run_specialists(client, ctx):
@@ -35,6 +36,9 @@ def main() -> None:
 
     print("\n🧠 Le chef de desk délibère…\n")
     d = pipeline.decide(client, ctx, reports)
+    with history.connect() as con:
+        history.save(con, asset=args.asset, style=style, price=ctx.price, decision=d,
+                     reports=reports, source=ctx.source)
     print(f"=== {d.decision} — confiance {d.confiance}% — {d.horizon} ===\n")
     print(d.synthese, "\n")
     if d.decision != "ATTENDRE":

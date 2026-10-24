@@ -1,5 +1,6 @@
 anthropic>=2.3.0
 yfinance>=1.7.0
+requests>=2.31
 pandas>=2.2
 numpy>=2.0
 pydantic>=2.7

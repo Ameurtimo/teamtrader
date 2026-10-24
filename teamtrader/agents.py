@@ -1,6 +1,6 @@
 """Les agents de TeamTrader.
 
-Trois spécialistes analysent chacun une dimension du marché, puis l'agent
+Quatre spécialistes analysent chacun une dimension du marché, puis l'agent
 général (le « chef de desk ») lit leurs rapports et prend la décision finale
 sous forme structurée (validée par Pydantic).
 """
@@ -37,8 +37,8 @@ Termine TOUJOURS ton rapport par cette section, exactement sous cette forme :
 """
 
 COMMON_RULES = """
-Tu fais partie d'une équipe de trading composée de trois analystes spécialisés \
-(fondamental, technique, géopolitique) et d'un chef de desk qui prend la décision \
+Tu fais partie d'une équipe de trading composée de quatre analystes spécialisés \
+(fondamental, technique, géopolitique, sentiment) et d'un chef de desk qui prend la décision \
 finale à partir de vos rapports. Reste dans ton domaine : les autres dimensions \
 sont couvertes par tes collègues.
 
@@ -72,7 +72,8 @@ l'actif. Pour l'or : dollar, taux réels US, anticipations sur la Fed (prochaine
 réunion, probabilités de baisse/hausse), inflation, achats des banques centrales, flux \
 ETF, demande physique. Pour le bitcoin : liquidité mondiale, appétit pour le risque, \
 flux des ETF spot, régulation, offre (halving, mineurs), indicateurs on-chain, \
-corrélation avec le Nasdaq.
+corrélation avec le Nasdaq. Le positionnement des traders (COT, funding, ratios \
+long/short) est couvert par l'analyste sentiment.
 
 Tu reçois un tableau de données inter-marchés. Utilise la recherche web pour les \
 publications récentes (calendrier économique de la semaine, dernières données CPI / \
@@ -130,7 +131,35 @@ venir qui représentent un risque de volatilité.
     ),
 )
 
-SPECIALISTS: tuple[AgentSpec, ...] = (FUNDAMENTAL, TECHNICAL, GEOPOLITICAL)
+SENTIMENT = AgentSpec(
+    key="sentiment",
+    name="Analyste sentiment",
+    icon="🧭",
+    web_search=True,
+    system=(
+        "Tu es l'analyste sentiment et positionnement de l'équipe.\n"
+        + COMMON_RULES
+        + """
+Ton travail : mesurer comment les autres acteurs sont positionnés et ce qu'ils \
+ressentent, pour repérer les excès. Pour l'or : rapport COT de la CFTC (position nette \
+des « managed money » et son évolution), ratios long/short des clients des brokers \
+(positionnement retail), tonalité des médias, demande pour les options. Pour le \
+bitcoin : indice Fear & Greed, taux de financement (funding) et open interest des \
+contrats perpétuels, liquidations récentes, ratio long/short, prime Coinbase, tonalité \
+des réseaux sociaux.
+
+Un sentiment extrême est souvent un signal contrarian (foule massivement acheteuse = \
+risque de purge, peur extrême = opportunité), alors qu'un sentiment modéré qui \
+s'améliore accompagne plutôt la tendance. Dis clairement dans quel cas on se trouve.
+
+Tu reçois les données de sentiment déjà disponibles ; complète avec la recherche web \
+en citant la date de chaque chiffre.
+"""
+        + SIGNAL_FORMAT
+    ),
+)
+
+SPECIALISTS: tuple[AgentSpec, ...] = (FUNDAMENTAL, TECHNICAL, GEOPOLITICAL, SENTIMENT)
 
 
 @dataclass
@@ -214,7 +243,7 @@ def run_specialist(
 
 
 class AgentView(BaseModel):
-    agent: Literal["fondamental", "technique", "geopolitique"]
+    agent: Literal["fondamental", "technique", "geopolitique", "sentiment"]
     direction: Literal["HAUSSIER", "BAISSIER", "NEUTRE"]
     poids_dans_la_decision: int = Field(description="Importance accordée à cet avis, de 0 à 100")
     commentaire: str = Field(description="Ce que tu retiens de ce rapport, en une ou deux phrases")
@@ -238,14 +267,16 @@ class TradingDecision(BaseModel):
     evenements_a_surveiller: list[str]
 
 
-DECISION_SYSTEM = """Tu es le chef de desk d'une équipe de trading. Trois analystes \
-(fondamental, technique, géopolitique) viennent de te remettre leurs rapports sur un \
+DECISION_SYSTEM = """Tu es le chef de desk d'une équipe de trading. Quatre analystes \
+(fondamental, technique, géopolitique, sentiment) viennent de te remettre leurs rapports sur un \
 actif. Ta mission : prendre UNE décision exploitable — ACHAT, VENTE ou ATTENDRE.
 
 Principes :
 - Pèse les rapports selon leur pertinence pour l'horizon de trading demandé : la \
 technique compte davantage à court terme, le fondamental à plus long terme, la \
-géopolitique surtout quand un événement majeur est en cours ou imminent.
+géopolitique surtout quand un événement majeur est en cours ou imminent, le \
+sentiment surtout quand il est extrême (risque de retournement) ou qu'il contredit \
+le mouvement des prix.
 - Un rapport vague, ancien ou incertain pèse moins qu'un rapport précis et daté.
 - Quand les analystes se contredisent sans argument décisif, ou que le rapport \
 risque/rendement est inférieur à 1,5, ATTENDRE est une décision légitime.
