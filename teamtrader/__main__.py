@@ -17,14 +17,18 @@ def main() -> None:
     p.add_argument("asset", choices=list(ASSETS))
     p.add_argument("--style", choices=list(STYLE_LABELS), default="swing")
     p.add_argument("--notes", default="")
+    p.add_argument("--smc", action="store_true",
+                   help="Mode Smart Money Concepts : entrée seulement après balayage de l'inducement")
     p.add_argument("--verbose", "-v", action="store_true", help="Affiche les rapports complets")
     args = p.parse_args()
 
     client = anthropic.Anthropic()
     print(f"Récupération des données pour {ASSETS[args.asset].name}…")
     style = STYLE_LABELS[args.style]
-    ctx = pipeline.prepare(args.asset, TRADING_STYLES[style], args.notes)
+    ctx = pipeline.prepare(args.asset, style, args.notes, smc_mode=args.smc)
     print(f"Prix actuel : {ctx.price:.2f} ({ctx.source})\n")
+    if ctx.smc_map:
+        print(f"🎯 Setup SMC : {ctx.smc_map.setup.status}\n")
 
     reports = []
     for r in pipeline.run_specialists(client, ctx):
@@ -38,7 +42,7 @@ def main() -> None:
     d = pipeline.decide(client, ctx, reports)
     with history.connect() as con:
         history.save(con, asset=args.asset, style=style, price=ctx.price, decision=d,
-                     reports=reports, source=ctx.source)
+                     reports=reports, source=ctx.source, mode="smc" if args.smc else "standard")
     print(f"=== {d.decision} — confiance {d.confiance}% — {d.horizon} ===\n")
     print(d.synthese, "\n")
     if d.decision != "ATTENDRE":

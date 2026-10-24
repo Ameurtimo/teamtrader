@@ -123,14 +123,16 @@ def resample(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     return out.dropna(subset=["Close"])
 
 
-def _yahoo_frames(asset: Asset, start: Optional[datetime]) -> dict[str, pd.DataFrame]:
+def _yahoo_frames(asset: Asset, start: Optional[datetime], with_15m: bool) -> dict:
     frames = {"1h": fetch_ohlcv(asset.yahoo, period="60d", interval="1h", start=start)}
     if start is None:
         frames["1d"] = fetch_ohlcv(asset.yahoo, period="2y", interval="1d")
+        if with_15m:
+            frames["15m"] = fetch_ohlcv(asset.yahoo, period="30d", interval="15m")
     return frames
 
 
-def _twelvedata_frames(asset: Asset, start: Optional[datetime]) -> dict[str, pd.DataFrame]:
+def _twelvedata_frames(asset: Asset, start: Optional[datetime], with_15m: bool) -> dict:
     key = config.TWELVEDATA_API_KEY
     if start is None:
         hours = 60 * 24
@@ -139,24 +141,28 @@ def _twelvedata_frames(asset: Asset, start: Optional[datetime]) -> dict[str, pd.
     frames = {"1h": twelvedata_ohlcv(asset.twelvedata, "1h", min(max(hours, 100), 5000), key)}
     if start is None:
         frames["1d"] = twelvedata_ohlcv(asset.twelvedata, "1day", 730, key)
+        if with_15m:
+            frames["15m"] = twelvedata_ohlcv(asset.twelvedata, "15min", 2000, key)
     return frames
 
 
-def get_price_history(asset: Asset, start: Optional[datetime] = None) -> PriceData:
-    """Bougies 1h, 4h et journalières (sans `start`) ou bougies 1h depuis `start`.
+def get_price_history(
+    asset: Asset, start: Optional[datetime] = None, with_15m: bool = False
+) -> PriceData:
+    """Bougies 1h, 4h et journalières (+ 15 min si `with_15m`, pour le mode SMC).
 
     Avec `start` (utilisé par l'historique), seules les bougies 1h sont renvoyées.
     """
     note = ""
     if config.TWELVEDATA_API_KEY and asset.twelvedata:
         try:
-            frames = _twelvedata_frames(asset, start)
+            frames = _twelvedata_frames(asset, start, with_15m)
             source = f"Twelve Data, spot {asset.twelvedata}"
             return PriceData(_with_4h(frames, start), source)
         except Exception as e:
             note = f" (Twelve Data indisponible : {e})"
 
-    frames = _yahoo_frames(asset, start)
+    frames = _yahoo_frames(asset, start, with_15m)
     source = f"Yahoo Finance {asset.yahoo}"
     if asset.spot_adjust:
         spot = gold_spot_price()
@@ -171,7 +177,8 @@ def get_price_history(asset: Asset, start: Optional[datetime] = None) -> PriceDa
 
 def _with_4h(frames: dict[str, pd.DataFrame], start: Optional[datetime]) -> dict:
     if start is None:
-        frames = {"1h": frames["1h"], "4h": resample(frames["1h"], "4h"), "1d": frames["1d"]}
+        frames = {**frames, "4h": resample(frames["1h"], "4h")}
+        frames = {tf: frames[tf] for tf in ("15m", "1h", "4h", "1d") if tf in frames}
     return frames
 
 

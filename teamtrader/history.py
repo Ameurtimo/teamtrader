@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     horizon TEXT,
     signals TEXT NOT NULL,
     source TEXT,
-    payload TEXT NOT NULL
+    payload TEXT NOT NULL,
+    mode TEXT NOT NULL DEFAULT 'standard'
 )
 """
 
@@ -59,6 +60,7 @@ class Record:
     horizon: str
     signals: dict[str, Optional[str]]
     source: str = ""
+    mode: str = "standard"  # standard | smc
 
     @property
     def expires_at(self) -> datetime:
@@ -83,17 +85,22 @@ class Outcome:
 def connect(path: str = config.HISTORY_DB) -> sqlite3.Connection:
     con = sqlite3.connect(path)
     con.execute(SCHEMA)
+    # Bases créées avant l'ajout du mode SMC : on ajoute la colonne manquante.
+    columns = {row[1] for row in con.execute("PRAGMA table_info(decisions)")}
+    if "mode" not in columns:
+        con.execute("ALTER TABLE decisions ADD COLUMN mode TEXT NOT NULL DEFAULT 'standard'")
+        con.commit()
     return con
 
 
 def save(con, *, asset: str, style: str, price: float, decision, reports, source: str = "",
-         created_at: Optional[datetime] = None) -> int:
+         created_at: Optional[datetime] = None, mode: str = "standard") -> int:
     created_at = created_at or datetime.now(timezone.utc)
     signals = {r.key: r.direction for r in reports}
     cur = con.execute(
         "INSERT INTO decisions (created_at, asset, style, max_hours, price, decision, "
-        "confidence, entry, stop, targets, horizon, signals, source, payload) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "confidence, entry, stop, targets, horizon, signals, source, payload, mode) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             created_at.isoformat(),
             asset,
@@ -109,6 +116,7 @@ def save(con, *, asset: str, style: str, price: float, decision, reports, source
             json.dumps(signals),
             source,
             decision.model_dump_json(),
+            mode,
         ),
     )
     con.commit()
@@ -118,14 +126,14 @@ def save(con, *, asset: str, style: str, price: float, decision, reports, source
 def load(con) -> list[Record]:
     rows = con.execute(
         "SELECT id, created_at, asset, style, max_hours, price, decision, confidence, entry, "
-        "stop, targets, horizon, signals, source FROM decisions ORDER BY created_at DESC"
+        "stop, targets, horizon, signals, source, mode FROM decisions ORDER BY created_at DESC"
     ).fetchall()
     return [
         Record(
             id=r[0], created_at=datetime.fromisoformat(r[1]), asset=r[2], style=r[3],
             max_hours=r[4], price=r[5], decision=r[6], confidence=r[7], entry=r[8], stop=r[9],
             targets=json.loads(r[10]), horizon=r[11] or "", signals=json.loads(r[12]),
-            source=r[13] or "",
+            source=r[13] or "", mode=r[14],
         )
         for r in rows
     ]

@@ -86,3 +86,6 @@ HISTORY_DB = os.environ.get("TEAMTRADER_DB", "teamtrader_history.db")
 
 # Nombre maximum de recherches web par agent.
 WEB_SEARCH_MAX_USES = int(os.environ.get("TEAMTRADER_WEB_SEARCH_MAX_USES", "6"))
+
+# Fuseau horaire d'affichage du calendrier économique.
+DISPLAY_TZ = os.environ.get("TEAMTRADER_TZ", "Europe/Paris")

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hmac
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import anthropic
 import pandas as pd
@@ -27,7 +27,9 @@ def _load_secrets() -> None:
 
 _load_secrets()
 
-from teamtrader import agents, config, data, history, indicators, pipeline  # noqa: E402
+from teamtrader import (  # noqa: E402
+    agents, config, data, economic_calendar, history, indicators, pipeline, smc,
+)
 from teamtrader.config import ASSETS, TRADING_STYLES  # noqa: E402
 
 DIRECTION_BADGE = {"HAUSSIER": "🟢 HAUSSIER", "BAISSIER": "🔴 BAISSIER", "NEUTRE": "⚪ NEUTRE"}
@@ -63,6 +65,206 @@ def add_levels(fig, d: agents.TradingDecision):
                       annotation_text="Stop")
     for i, tp in enumerate(d.take_profits, 1):
         fig.add_hline(y=tp, line_dash="dot", line_color="#16a34a", annotation_text=f"TP{i}")
+
+
+# ------------------------------------------------------------------------------ SMC
+
+SETUP_COLOR = {True: "#16a34a", False: "#d97706"}
+
+
+def smc_chart(df: pd.DataFrame, m: smc.SMCMap, title: str):
+    df = df.tail(220)
+    start = df.index[0]
+    fig = go.Figure(go.Candlestick(x=df.index, open=df.Open, high=df.High, low=df.Low,
+                                   close=df.Close, name=m.timeframe))
+    end = df.index[-1]
+    zones = [z for z in m.order_blocks if z.state != "invalidé"][-4:] + m.fvgs[-4:]
+    if m.setup.poi is not None and m.setup.poi not in zones:
+        zones.append(m.setup.poi)
+    for z in zones:
+        if z.ts < start:
+            continue
+        bull = z.direction == "haussier"
+        color = ("rgba(22,163,74,{a})" if bull else "rgba(220,38,38,{a})")
+        alpha = 0.22 if z.kind == "OB" else 0.10
+        fig.add_shape(type="rect", x0=z.ts, x1=end, y0=z.bottom, y1=z.top, line_width=0,
+                      fillcolor=color.format(a=alpha), layer="below")
+        fig.add_annotation(x=z.ts, y=z.top, text=z.kind, showarrow=False, xanchor="left",
+                           yanchor="bottom", font={"size": 9})
+    for b in m.breaks[-6:]:
+        if b.ts < start:
+            continue
+        fig.add_shape(type="line", x0=max(b.swing_ts, start), x1=b.ts, y0=b.level, y1=b.level,
+                      line={"width": 1, "dash": "dot",
+                            "color": "#16a34a" if b.direction == "haussier" else "#dc2626"})
+        fig.add_annotation(x=b.ts, y=b.level, text=b.kind, showarrow=False, yanchor="bottom",
+                           font={"size": 9})
+    for liq in m.liquidity:
+        fig.add_hline(y=liq.price, line_dash="dash", line_width=1, line_color="#7c3aed",
+                      annotation_text=f"liquidité ({liq.kind})", annotation_font_size=9)
+    s = m.setup
+    if s.idm_level is not None:
+        fig.add_hline(y=s.idm_level, line_width=1.5, line_color="#d97706",
+                      annotation_text="IDM ✓ balayé" if s.idm_swept else "IDM (non balayé)",
+                      annotation_font_size=10)
+    if s.equilibrium is not None:
+        fig.add_hline(y=s.equilibrium, line_dash="dot", line_width=1, line_color="#6b7280",
+                      annotation_text="50 %", annotation_font_size=9)
+    fig.update_layout(height=480, margin={"l": 10, "r": 10, "t": 30, "b": 10},
+                      xaxis_rangeslider_visible=False, title=title, showlegend=False)
+    return fig
+
+
+def render_smc(m: smc.SMCMap, df: pd.DataFrame, asset_name: str):
+    s = m.setup
+    color = "#dc2626" if s.status.startswith("invalidé") else SETUP_COLOR[s.entry_allowed]
+    verdict = "ENTRÉE VALIDE" if s.entry_allowed else "PAS D'ENTRÉE"
+    st.markdown(
+        f"<div style='padding:14px;border-radius:12px;background:{color};color:white'>"
+        f"<div style='font-size:13px;opacity:.85'>Smart Money Concepts · {m.timeframe}"
+        f" (biais {m.htf_timeframe} : {m.htf_trend or 'indéterminé'})</div>"
+        f"<div style='font-size:26px;font-weight:700'>{verdict} · setup "
+        f"{s.direction or '—'}</div><div style='font-size:15px'>{s.status}</div></div>",
+        unsafe_allow_html=True,
+    )
+    st.write("")
+    c = st.columns(5)
+    idm_delta = None if s.idm_level is None else ("balayé ✓" if s.idm_swept else "non balayé")
+    c[0].metric("Inducement", fmt(s.idm_level), idm_delta,
+                delta_color="normal" if s.idm_swept else "off")
+    c[1].metric("POI", f"{s.poi.bottom:,.2f}–{s.poi.top:,.2f}" if s.poi else "—",
+                s.poi.kind if s.poi else None, delta_color="off")
+    c[2].metric("Entrée", fmt(s.entry))
+    c[3].metric("Stop", fmt(s.stop))
+    c[4].metric("Objectifs", " / ".join(f"{t:,.0f}" for t in s.targets) or "—")
+    for n in s.notes:
+        st.markdown(f"- {n}")
+    st.plotly_chart(smc_chart(df, m, f"{asset_name} — SMC {m.timeframe}"), width="stretch")
+    with st.expander("Cartographie complète"):
+        st.code(smc.format_map(m), language=None)
+
+
+@st.cache_data(ttl=300, show_spinner="Scan SMC…")
+def smc_scan(asset_key: str, style_label: str):
+    # Les erreurs sont mises en cache aussi : une source en panne ne ralentit pas chaque clic.
+    try:
+        prices = data.get_price_history(ASSETS[asset_key], with_15m=True)
+        tf, _ = smc.STYLE_TIMEFRAMES[style_label]
+        return (pipeline.smc_for(prices.frames, style_label), prices.frames[tf],
+                prices.source), None
+    except Exception as e:
+        return None, str(e)
+
+
+def render_smc_scanner(asset_key: str, style_label: str):
+    st.caption("Lecture SMC calculée automatiquement à partir des prix — instantanée et "
+               "gratuite (aucun appel à l'IA). Règle appliquée : une entrée n'est valide "
+               "qu'après le balayage de l'inducement.")
+    if st.button("🔄 Rescanner"):
+        smc_scan.clear()
+    result, error = smc_scan(asset_key, style_label)
+    if error:
+        st.error(f"Impossible de récupérer les prix : {error}")
+        return
+    m, df, source = result
+    render_smc(m, df, ASSETS[asset_key].name)
+    st.caption(f"Source des prix : {source}")
+
+
+# ------------------------------------------------------------------------------ calendrier
+
+ARROW = {"AU-DESSUS": "⬆️ au-dessus", "EN DESSOUS": "⬇️ en dessous", "CONFORME": "➡️ conforme"}
+
+
+def utc_to_local(value: str) -> str:
+    try:
+        t = datetime.strptime(value.strip()[:16], "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return value
+    return economic_calendar.local_time(t, config.DISPLAY_TZ)
+
+
+@st.cache_data(ttl=1800, show_spinner="Chargement du calendrier…")
+def calendar_events():
+    try:
+        return economic_calendar.fetch_us_events(), None
+    except Exception as e:
+        return [], str(e)
+
+
+def calendar_summary(forecast: agents.CalendarForecast) -> str:
+    return "\n".join(
+        f"- {e.date_heure_utc} UTC — {e.evenement} : {e.prevision} du consensus "
+        f"({e.consensus}), estimation {e.estimation}, probabilité {e.probabilite} % ; "
+        f"réaction attendue or {e.reaction_or}, BTC {e.reaction_btc}, USD {e.reaction_usd}"
+        for e in forecast.evenements
+    ) + f"\nSynthèse : {forecast.synthese}"
+
+
+def render_calendar(api_key: str):
+    tz = config.DISPLAY_TZ
+    events, error = calendar_events()
+    if error:
+        st.warning(f"Calendrier indisponible ({error}) : l'économiste IA le retrouvera par "
+                   "recherche web.")
+        calendar_text = "Calendrier indisponible : retrouve-le par recherche web."
+    else:
+        st.markdown(f"**Publications américaines de la semaine** (impact fort et moyen, "
+                    f"heures {tz})")
+        st.markdown(economic_calendar.format_events(events, tz))
+        calendar_text = economic_calendar.format_events(events)
+
+    st.write("")
+    if st.button("🔮 Prédire la direction des publications", type="primary"):
+        if not api_key:
+            st.error("Renseigne ta clé API Anthropic.")
+        else:
+            with st.spinner("L'économiste analyse les indicateurs avancés (1 à 3 minutes)…"):
+                try:
+                    forecast, report = agents.forecast_calendar(
+                        anthropic.Anthropic(api_key=api_key), calendar_text)
+                except Exception as e:
+                    forecast, report = None, agents.AgentReport(
+                        key="calendrier", name="", icon="", error=str(e))
+            st.session_state["calendar"] = (datetime.now(), forecast, report)
+
+    if "calendar" not in st.session_state:
+        st.info("Clique sur le bouton pour obtenir une prévision (au-dessus / en dessous du "
+                "consensus) de chaque publication importante, avant sa sortie. Les "
+                "prévisions sont ensuite transmises au chef de desk lors des analyses.")
+        return
+    when, forecast, report = st.session_state["calendar"]
+    if forecast is None:
+        st.error(report.error or "Prévision indisponible.")
+        return
+    st.caption(f"Prévisions générées le {when:%d/%m à %H:%M}")
+    st.markdown(f"**Synthèse :** {forecast.synthese}")
+    st.dataframe(
+        [
+            {
+                f"Date ({config.DISPLAY_TZ})": utc_to_local(e.date_heure_utc),
+                "Publication": e.evenement,
+                "Impact": e.importance, "Précédent": e.precedent, "Consensus": e.consensus,
+                "Prévision IA": ARROW[e.prevision], "Estimation": e.estimation,
+                "Probabilité": f"{e.probabilite}%", "Or": DIRECTION_BADGE[e.reaction_or],
+                "BTC": DIRECTION_BADGE[e.reaction_btc], "Dollar": DIRECTION_BADGE[e.reaction_usd],
+            }
+            for e in forecast.evenements
+        ],
+        hide_index=True, width="stretch",
+    )
+    for e in forecast.evenements:
+        with st.expander(f"{ARROW[e.prevision]} · {e.evenement} ({utc_to_local(e.date_heure_utc)})"):
+            st.markdown(e.explication)
+            st.markdown("**Indicateurs avancés :**\n" + "\n".join(f"- {x}" for x in e.indicateurs_avances))
+    st.info(f"**Gestion du risque :** {forecast.gestion_du_risque}")
+    with st.expander("Note complète de l'économiste et sources"):
+        st.markdown(report.text)
+        for src in report.sources[:15]:
+            st.markdown(f"- [{src['title']}]({src['url']})")
+    st.caption("Une prévision n'est pas une certitude : même les meilleurs économistes se "
+               "trompent souvent sur l'écart au consensus. Le mouvement réel dépend aussi "
+               "des révisions et du détail des chiffres.")
 
 
 def render_report(r: agents.AgentReport):
@@ -149,7 +351,7 @@ STATUS_ICON = {
 }
 
 
-AGENT_LABELS = {s.key: f"{s.icon} {s.name}" for s in agents.SPECIALISTS}
+AGENT_LABELS = {s.key: f"{s.icon} {s.name}" for s in agents.DECISION_AGENTS}
 AGENT_LABELS["chef de desk"] = "🧠 Chef de desk (décision finale)"
 
 
@@ -185,8 +387,16 @@ def render_history():
         st.info("Aucune décision enregistrée pour l'instant : chaque analyse terminée "
                 "est ajoutée automatiquement à l'historique.")
         return
-    if st.button("🔄 Actualiser les prix"):
+    top = st.columns([1, 2])
+    if top[0].button("🔄 Actualiser les prix"):
         candles_since.clear()
+    mode = top[1].radio("Décisions", ["Toutes", "Standard", "SMC"], horizontal=True,
+                        label_visibility="collapsed")
+    if mode != "Toutes":
+        records = [r for r in records if r.mode == mode.lower()]
+        if not records:
+            st.info(f"Aucune décision en mode {mode}.")
+            return
     pairs = evaluate_all(records)
     stats = history.statistics(pairs)
 
@@ -222,6 +432,7 @@ def render_history():
             "Date (UTC)": r.created_at.strftime("%Y-%m-%d %H:%M"),
             "Actif": r.asset,
             "Style": r.style.split(" (")[0],
+            "Mode": "🎯 SMC" if r.mode == "smc" else "standard",
             "Décision": r.decision,
             "Confiance": fmt(r.confidence, "{}%"),
             "Prix": fmt(r.price),
@@ -231,7 +442,7 @@ def render_history():
             "Résultat": STATUS_ICON.get(o.status, o.status),
             "R": fmt(o.r_multiple, "{:+.2f}"),
             "Variation prix": fmt(o.price_move_pct, "{:+.2f}%"),
-            **{f"{s.icon} {s.key}": r.signals.get(s.key) or "—" for s in agents.SPECIALISTS},
+            **{f"{s.icon} {s.key}": r.signals.get(s.key) or "—" for s in agents.DECISION_AGENTS},
         }
         for r, o in pairs
     ]
@@ -252,7 +463,7 @@ def render_history():
                "les deux, on compte une perte.")
 
 
-def run_analysis(api_key: str, asset_key: str, style: str, notes: str) -> None:
+def run_analysis(api_key: str, asset_key: str, style: str, notes: str, smc_mode: bool) -> None:
     if not api_key:
         st.error("Renseigne ta clé API Anthropic (variable ANTHROPIC_API_KEY ou champ à gauche).")
         return
@@ -262,12 +473,14 @@ def run_analysis(api_key: str, asset_key: str, style: str, notes: str) -> None:
     with st.status("Analyse en cours…", expanded=True) as status:
         st.write("📥 Récupération des données de marché…")
         try:
-            ctx = pipeline.prepare(asset_key, TRADING_STYLES[style], notes)
+            ctx = pipeline.prepare(asset_key, style, notes, smc_mode=smc_mode)
         except Exception as e:
             status.update(label="Échec de la récupération des données", state="error")
             st.error(f"Impossible de récupérer les données de marché : {e}")
             return
-        st.write(f"Prix actuel : **{ctx.price:,.2f}** — les {len(agents.SPECIALISTS)} "
+        if ctx.smc_map:
+            st.write(f"🎯 Setup SMC ({ctx.smc_map.timeframe}) : **{ctx.smc_map.setup.status}**")
+        st.write(f"Prix actuel : **{ctx.price:,.2f}** — les {len(ctx.agent_specs)} "
                  "analystes travaillent en parallèle…")
 
         reports = []
@@ -278,7 +491,11 @@ def run_analysis(api_key: str, asset_key: str, style: str, notes: str) -> None:
 
         st.write("🧠 Le chef de desk délibère…")
         try:
-            decision = pipeline.decide(client, ctx, reports)
+            forecast = st.session_state.get("calendar", (None, None, None))[1]
+            decision = pipeline.decide(
+                client, ctx, reports,
+                calendar_forecast=calendar_summary(forecast) if forecast else "",
+            )
         except Exception as e:
             status.update(label="Échec de la décision", state="error")
             st.error(str(e))
@@ -287,7 +504,8 @@ def run_analysis(api_key: str, asset_key: str, style: str, notes: str) -> None:
             try:
                 with history.connect() as con:
                     history.save(con, asset=asset_key, style=style, price=ctx.price,
-                                 decision=decision, reports=reports, source=ctx.source)
+                                 decision=decision, reports=reports, source=ctx.source,
+                                 mode="smc" if ctx.smc_map else "standard")
             except Exception as e:
                 st.warning(f"Décision non enregistrée dans l'historique : {e}")
             status.update(label="Analyse terminée", state="complete", expanded=False)
@@ -309,8 +527,8 @@ if password and not st.session_state.get("authenticated"):
 
 st.title("📈 TeamTrader")
 st.caption(
-    "Quatre agents IA analysent le marché (fondamental, technique, géopolitique, sentiment), "
-    "puis un agent général prend la décision."
+    "Des agents IA analysent le marché (fondamental, technique, géopolitique, sentiment, "
+    "et Smart Money en option), puis un agent général prend la décision."
 )
 
 with st.sidebar:
@@ -321,6 +539,12 @@ with st.sidebar:
     style = st.selectbox("Style de trading", list(TRADING_STYLES))
     capital = st.number_input("Capital (USD)", min_value=0.0, value=10_000.0, step=1_000.0)
     risk = st.slider("Risque par trade (% du capital)", 0.25, 5.0, 1.0, 0.25)
+    smc_mode = st.toggle(
+        "🎯 Mode Smart Money Concepts",
+        help="Ajoute l'analyste SMC (structure, order blocks, FVG, liquidité). "
+             "Une entrée n'est validée qu'après le balayage de l'inducement : sinon la "
+             "décision est automatiquement ATTENDRE.",
+    )
     notes = st.text_area("Remarques pour l'équipe (optionnel)",
                          placeholder="Ex : je suis déjà long depuis 2650…")
     api_key = os.environ.get("ANTHROPIC_API_KEY") or st.text_input(
@@ -329,11 +553,13 @@ with st.sidebar:
     run = st.button("🚀 Lancer l'analyse", type="primary", width="stretch")
     st.caption(f"Modèle : `{config.MODEL}`")
 
-tab_analysis, tab_history = st.tabs(["🔎 Analyse", "📒 Historique et fiabilité"])
+tab_analysis, tab_calendar, tab_smc, tab_history = st.tabs(
+    ["🔎 Analyse", "📅 Calendrier US", "🎯 Scanner SMC", "📒 Historique et fiabilité"]
+)
 
 with tab_analysis:
     if run:
-        run_analysis(api_key, asset_key, style, notes)
+        run_analysis(api_key, asset_key, style, notes, smc_mode)
 
     if "result" in st.session_state:
         ctx, reports, decision = st.session_state["result"]
@@ -343,12 +569,21 @@ with tab_analysis:
             render_decision(ctx, decision, capital, risk)
         st.plotly_chart(fig, width="stretch")
         st.caption(f"Source des prix : {ctx.source}")
+        if ctx.smc_map:
+            st.subheader("🎯 Lecture Smart Money")
+            render_smc(ctx.smc_map, ctx.frames[ctx.smc_map.timeframe], ctx.asset.name)
         st.subheader("Rapports détaillés")
-        order = {s.key: i for i, s in enumerate(agents.SPECIALISTS)}
-        for r in sorted(reports, key=lambda r: order[r.key]):
+        order = {s.key: i for i, s in enumerate(agents.DECISION_AGENTS)}
+        for r in sorted(reports, key=lambda r: order.get(r.key, 99)):
             render_report(r)
     else:
         st.info("Choisis un actif à gauche puis clique sur **Lancer l'analyse**.")
+
+with tab_calendar:
+    render_calendar(api_key)
+
+with tab_smc:
+    render_smc_scanner(asset_key, style)
 
 with tab_history:
     render_history()
