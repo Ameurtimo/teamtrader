@@ -5,3 +5,4 @@ __pycache__/
 .pytest_cache/
 .streamlit/secrets.toml
 teamtrader_history.db
+*.avant-restauration

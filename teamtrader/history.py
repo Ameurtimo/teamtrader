@@ -1,26 +1,27 @@
 """Journal des décisions et mesure de leur fiabilité.
 
-Chaque décision est enregistrée dans une base SQLite. On la rejoue ensuite sur les
-bougies 1h qui ont suivi : l'ordre a-t-il été déclenché, puis l'objectif 1 ou le
-stop a-t-il été touché en premier ? On mesure aussi, pour chaque analyste, si son
-signal (haussier / baissier) allait dans le sens du marché sur l'horizon prévu.
+Chaque décision est enregistrée dans une base SQLite avec la source de prix et
+l'écart future/spot utilisés à ce moment-là. On la rejoue ensuite sur les bougies qui
+ont suivi (15 min quand c'est possible, sinon 1 h) avec le moteur `replay`.
+
+Reproductibilité : dès que les données couvrent toute la période de la décision, le
+résultat est FIGÉ dans la base avec les bougies utilisées et la version de la méthode.
+Il ne change plus ensuite, même si la source ou l'écart future/spot évoluent. Si la
+méthode change de version, le résultat est recalculé à partir des bougies conservées.
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass, field
+import zlib
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Callable, Optional
 
 import pandas as pd
 
-from . import config
-
-# Une entrée à moins de 0,1 % du prix au moment de la décision est considérée
-# comme exécutée au marché.
-MARKET_ENTRY_TOLERANCE = 0.001
+from . import config, replay
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS decisions (
@@ -43,6 +44,19 @@ CREATE TABLE IF NOT EXISTS decisions (
 )
 """
 
+# Colonnes ajoutées après la première version : créées à l'ouverture si absentes.
+MIGRATIONS = {
+    "mode": "TEXT NOT NULL DEFAULT 'standard'",
+    "provider": "TEXT",
+    "basis": "REAL",
+    "outcome": "TEXT",
+    "candles": "BLOB",
+    "analysis": "TEXT",
+}
+
+# Statut « historique » affiché pour chaque résultat du moteur de rejeu.
+CLOSED = ("objectif", "stop", "expiré")
+
 
 @dataclass
 class Record:
@@ -61,6 +75,10 @@ class Record:
     signals: dict[str, Optional[str]]
     source: str = ""
     mode: str = "standard"  # standard | smc
+    provider: Optional[str] = None  # None : décision antérieure au suivi de la source
+    basis: Optional[float] = None
+    frozen: Optional["Outcome"] = None
+    analysis: Optional[dict] = None
 
     @property
     def expires_at(self) -> datetime:
@@ -72,11 +90,18 @@ class Outcome:
     status: str
     price_move_pct: Optional[float] = None
     r_multiple: Optional[float] = None
-    filled_at: Optional[datetime] = None
-    closed_at: Optional[datetime] = None
+    filled_at: Optional[str] = None
+    closed_at: Optional[str] = None
     exit_price: Optional[float] = None
     window_complete: bool = False
-    details: dict = field(default_factory=dict)
+    ambiguities: list[str] = field(default_factory=list)
+    data_note: str = ""
+    method: str = field(default_factory=lambda: replay.METHOD_VERSION)
+    frozen: bool = False
+
+    @property
+    def is_trade(self) -> bool:
+        return self.status in CLOSED or self.status == "en cours"
 
 
 # ------------------------------------------------------------------ stockage
@@ -85,58 +110,54 @@ class Outcome:
 def connect(path: str = config.HISTORY_DB) -> sqlite3.Connection:
     con = sqlite3.connect(path)
     con.execute(SCHEMA)
-    # Bases créées avant l'ajout du mode SMC : on ajoute la colonne manquante.
     columns = {row[1] for row in con.execute("PRAGMA table_info(decisions)")}
-    if "mode" not in columns:
-        con.execute("ALTER TABLE decisions ADD COLUMN mode TEXT NOT NULL DEFAULT 'standard'")
-        con.commit()
+    for name, ddl in MIGRATIONS.items():
+        if name not in columns:
+            con.execute(f"ALTER TABLE decisions ADD COLUMN {name} {ddl}")
+    con.commit()
     return con
 
 
 def save(con, *, asset: str, style: str, price: float, decision, reports, source: str = "",
-         created_at: Optional[datetime] = None, mode: str = "standard") -> int:
+         created_at: Optional[datetime] = None, mode: str = "standard",
+         provider: Optional[str] = None, basis: Optional[float] = None,
+         analysis: Optional[dict] = None) -> int:
     created_at = created_at or datetime.now(timezone.utc)
     signals = {r.key: r.direction for r in reports}
     cur = con.execute(
         "INSERT INTO decisions (created_at, asset, style, max_hours, price, decision, "
-        "confidence, entry, stop, targets, horizon, signals, source, payload, mode) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "confidence, entry, stop, targets, horizon, signals, source, payload, mode, provider, "
+        "basis, analysis) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
-            created_at.isoformat(),
-            asset,
-            style,
-            config.STYLE_MAX_HOURS.get(style, 240),
-            price,
-            decision.decision,
-            decision.confiance,
-            decision.prix_entree,
-            decision.stop_loss,
-            json.dumps(decision.take_profits),
-            decision.horizon,
-            json.dumps(signals),
-            source,
-            decision.model_dump_json(),
-            mode,
+            created_at.isoformat(), asset, style, config.STYLE_MAX_HOURS.get(style, 240), price,
+            decision.decision, decision.confiance, decision.prix_entree, decision.stop_loss,
+            json.dumps(decision.take_profits), decision.horizon, json.dumps(signals), source,
+            decision.model_dump_json(), mode, provider, basis,
+            json.dumps(analysis, ensure_ascii=False, default=str) if analysis else None,
         ),
     )
     con.commit()
     return cur.lastrowid
 
 
+COLUMNS = ("id, created_at, asset, style, max_hours, price, decision, confidence, entry, stop, "
+           "targets, horizon, signals, source, mode, provider, basis, outcome, analysis")
+
+
+def _record(r) -> Record:
+    frozen = Outcome(**json.loads(r[17])) if r[17] else None
+    return Record(
+        id=r[0], created_at=datetime.fromisoformat(r[1]), asset=r[2], style=r[3],
+        max_hours=r[4], price=r[5], decision=r[6], confidence=r[7], entry=r[8], stop=r[9],
+        targets=json.loads(r[10]), horizon=r[11] or "", signals=json.loads(r[12]),
+        source=r[13] or "", mode=r[14], provider=r[15], basis=r[16], frozen=frozen,
+        analysis=json.loads(r[18]) if r[18] else None,
+    )
+
+
 def load(con) -> list[Record]:
-    rows = con.execute(
-        "SELECT id, created_at, asset, style, max_hours, price, decision, confidence, entry, "
-        "stop, targets, horizon, signals, source, mode FROM decisions ORDER BY created_at DESC"
-    ).fetchall()
-    return [
-        Record(
-            id=r[0], created_at=datetime.fromisoformat(r[1]), asset=r[2], style=r[3],
-            max_hours=r[4], price=r[5], decision=r[6], confidence=r[7], entry=r[8], stop=r[9],
-            targets=json.loads(r[10]), horizon=r[11] or "", signals=json.loads(r[12]),
-            source=r[13] or "", mode=r[14],
-        )
-        for r in rows
-    ]
+    rows = con.execute(f"SELECT {COLUMNS} FROM decisions ORDER BY created_at DESC").fetchall()
+    return [_record(r) for r in rows]
 
 
 def delete(con, record_id: int) -> None:
@@ -144,78 +165,175 @@ def delete(con, record_id: int) -> None:
     con.commit()
 
 
+def freeze(con, rec: Record, outcome: Outcome, window: pd.DataFrame) -> None:
+    outcome.frozen = True
+    blob = zlib.compress(json.dumps(replay.to_records(window)).encode())
+    con.execute("UPDATE decisions SET outcome = ?, candles = ? WHERE id = ?",
+                (json.dumps(asdict(outcome), ensure_ascii=False), blob, rec.id))
+    con.commit()
+    rec.frozen = outcome
+
+
+def stored_candles(con, record_id: int) -> pd.DataFrame:
+    row = con.execute("SELECT candles FROM decisions WHERE id = ?", (record_id,)).fetchone()
+    if not row or not row[0]:
+        return replay.from_records([])
+    return replay.from_records(json.loads(zlib.decompress(row[0])))
+
+
 # ------------------------------------------------------------------ évaluation
 
 
-def evaluate(rec: Record, candles: pd.DataFrame, now: Optional[datetime] = None) -> Outcome:
-    """Rejoue une décision sur les bougies 1h postérieures à sa création.
-
-    Si une même bougie touche le stop et l'objectif, on compte une perte (on ne
-    peut pas savoir lequel est arrivé en premier : hypothèse prudente).
-    """
+def evaluate(rec: Record, candles: pd.DataFrame, now: Optional[datetime] = None,
+             tf: str = "1h") -> Outcome:
+    """Rejoue une décision sur des bougies (déjà dans la même référence de prix)."""
     now = now or datetime.now(timezone.utc)
-    complete = now >= rec.expires_at
-    window = candles[(candles.index > rec.created_at) & (candles.index <= rec.expires_at)]
+    candles = replay.drop_open_candle(candles, replay.TF_MINUTES[tf], now)
+    cov = replay.coverage(candles, rec.created_at, rec.expires_at, tf, rec.asset, now)
+    window = replay.window_candles(candles, rec.created_at, rec.expires_at, tf)
+    window = window[window.index < rec.expires_at]
+    if not cov.starts_ok:
+        return Outcome("en attente de données", window_complete=False, data_note=cov.note)
     if window.empty:
-        return Outcome(status="en attente de données", window_complete=complete)
-
-    last_close = float(window["Close"].iloc[-1])
-    move = (last_close / rec.price - 1) * 100
+        return Outcome("en attente de données", window_complete=cov.complete,
+                       data_note=cov.note)
+    move = (float(window["Close"].iloc[-1]) / rec.price - 1) * 100
     if rec.decision == "ATTENDRE":
-        return Outcome(status="pas de trade", price_move_pct=move, window_complete=complete)
+        return Outcome("pas de trade", price_move_pct=move, window_complete=cov.complete,
+                       data_note=cov.note)
 
-    long = rec.decision == "ACHAT"
-    entry = rec.entry or rec.price
-    tp = rec.targets[0] if rec.targets else None
-
-    # 1. Déclenchement de l'ordre.
-    if abs(entry - rec.price) / rec.price <= MARKET_ENTRY_TOLERANCE:
-        fill_idx = 0
-    else:
-        hit = (window["Low"] <= entry) & (window["High"] >= entry)
-        if not hit.any():
-            status = "non déclenché" if complete else "en attente d'entrée"
-            return Outcome(status=status, price_move_pct=move, window_complete=complete)
-        fill_idx = int(hit.to_numpy().argmax())
-    filled_at = window.index[fill_idx]
-    after = window.iloc[fill_idx:]
-
-    # 2. Stop ou objectif.
-    risk = abs(entry - rec.stop) if rec.stop else None
-    for ts, c in after.iterrows():
-        stop_hit = rec.stop is not None and (c.Low <= rec.stop if long else c.High >= rec.stop)
-        tp_hit = tp is not None and (c.High >= tp if long else c.Low <= tp)
-        if stop_hit:
-            return Outcome(
-                status="perdant", price_move_pct=move, r_multiple=-1.0 if risk else None,
-                filled_at=filled_at, closed_at=ts, exit_price=rec.stop, window_complete=complete,
-            )
-        if tp_hit:
-            return Outcome(
-                status="gagnant", price_move_pct=move,
-                r_multiple=abs(tp - entry) / risk if risk else None,
-                filled_at=filled_at, closed_at=ts, exit_price=tp, window_complete=complete,
-            )
-
-    # 3. Ni l'un ni l'autre : position encore ouverte ou clôturée à l'expiration.
-    signed = (last_close - entry) if long else (entry - last_close)
+    res = replay.replay(
+        long=rec.decision == "ACHAT", entry=rec.entry or rec.price, stop=rec.stop,
+        target=rec.targets[0] if rec.targets else None, price_at_decision=rec.price,
+        created_at=rec.created_at, expires_at=rec.expires_at, candles=candles, tf=tf,
+        complete=cov.complete,
+    )
     return Outcome(
-        status="expiré" if complete else "en cours",
-        price_move_pct=move,
-        r_multiple=signed / risk if risk else None,
-        filled_at=filled_at,
-        closed_at=window.index[-1] if complete else None,
-        exit_price=last_close,
-        window_complete=complete,
+        status=res.status, price_move_pct=move, r_multiple=res.r_multiple,
+        filled_at=res.filled_at.isoformat() if res.filled_at else None,
+        closed_at=res.exit_at.isoformat() if res.exit_at else None,
+        exit_price=res.exit_price, window_complete=cov.complete,
+        ambiguities=res.ambiguities, data_note=cov.note,
     )
 
 
+Fetcher = Callable[[str, str, datetime, str], pd.DataFrame]
+
+
+def evaluate_all(con, records: list[Record], fetch: Fetcher,
+                 legacy_basis: Callable[[str], float] = lambda asset: 0.0,
+                 now: Optional[datetime] = None) -> list[tuple[Record, Outcome]]:
+    """Évalue toutes les décisions, en figeant celles dont la période est couverte.
+
+    fetch(asset, provider, start, tf) renvoie des bougies BRUTES de ce fournisseur.
+    legacy_basis(asset) : écart future/spot à utiliser pour les anciennes décisions qui
+    ne l'ont pas enregistré (approximation, signalée).
+    """
+    now = now or datetime.now(timezone.utc)
+    pairs: list[tuple[Record, Outcome]] = []
+    todo: list[Record] = []
+    for r in records:
+        if r.frozen and r.frozen.method == replay.METHOD_VERSION:
+            pairs.append((r, r.frozen))
+        elif r.frozen:
+            # Méthode modifiée : on recalcule à partir des bougies conservées.
+            window = stored_candles(con, r.id)
+            out = evaluate(r, _with_tail(window, r), now, _tf_of(r.frozen.data_note))
+            out.data_note += " — recalculé à partir des bougies conservées"
+            freeze(con, r, out, window)
+            pairs.append((r, out))
+        else:
+            todo.append(r)
+
+    groups: dict[tuple, list[Record]] = {}
+    for r in todo:
+        groups.setdefault((r.asset, r.provider or "yahoo"), []).append(r)
+    for (asset, provider), recs in groups.items():
+        start = min(r.created_at for r in recs) - timedelta(hours=1)
+        candles, tf, note = replay.fetch_best(fetch, asset, provider, start)
+        for r in recs:
+            if candles is None:
+                pairs.append((r, Outcome("en attente de données", data_note=note)))
+                continue
+            basis = r.basis
+            extra = note
+            if basis is None:
+                basis = legacy_basis(asset) if provider == "yahoo" else 0.0
+                if basis:
+                    extra += " ; écart future/spot d'origine inconnu (ancienne décision) : " \
+                             "estimé avec l'écart actuel"
+            adjusted = candles.copy()
+            adjusted[["Open", "High", "Low", "Close"]] -= basis
+            out = evaluate(r, adjusted, now, tf)
+            if extra:
+                out.data_note = f"{out.data_note} ; {extra.strip(' ;')}"
+            if out.window_complete and out.status != "en attente de données":
+                window = replay.window_candles(adjusted, r.created_at, r.expires_at, tf)
+                freeze(con, r, out, window)
+            pairs.append((r, out))
+    return sorted(pairs, key=lambda p: p[0].created_at, reverse=True)
+
+
+def _tf_of(note: str) -> str:
+    return "15m" if "bougies 15m" in note else "1h"
+
+
+def _with_tail(window: pd.DataFrame, rec: Record) -> pd.DataFrame:
+    """Bougies conservées + une bougie fictive après l'échéance pour marquer la couverture."""
+    if window.empty:
+        return window
+    tail = pd.DataFrame([window.iloc[-1].to_dict()], index=[pd.Timestamp(rec.expires_at)])
+    return pd.concat([window, tail])
+
+
+# ------------------------------------------------------------------ statistiques
+
+
+def _drawdown(curve: list[float]) -> float:
+    peak, dd = 0.0, 0.0
+    for v in curve:
+        peak = max(peak, v)
+        dd = min(dd, v - peak)
+    return dd
+
+
+def _trade_stats(pairs: list[tuple[Record, Outcome]]) -> dict:
+    closed = [(r, o) for r, o in pairs if o.status in CLOSED and o.r_multiple is not None]
+    rs = [o.r_multiple for _, o in closed]
+    gains = sum(x for x in rs if x > 0)
+    losses = -sum(x for x in rs if x < 0)
+    tp = sum(1 for _, o in closed if o.status == "objectif")
+    sl = sum(1 for _, o in closed if o.status == "stop")
+    ordered = sorted(closed, key=lambda p: p[1].closed_at or p[0].created_at.isoformat())
+    curve, total = [], 0.0
+    for _, o in ordered:
+        total += o.r_multiple
+        curve.append(total)
+    return {
+        "trades_clotures": len(closed),
+        "objectifs": tp,
+        "stops": sl,
+        "expires_gagnants": sum(1 for _, o in closed if o.status == "expiré" and o.r_multiple > 0),
+        "expires_perdants": sum(1 for _, o in closed if o.status == "expiré" and o.r_multiple <= 0),
+        "taux_objectif": tp / (tp + sl) * 100 if tp + sl else None,
+        "taux_gagnants": sum(1 for x in rs if x > 0) / len(rs) * 100 if rs else None,
+        "r_moyen": sum(rs) / len(rs) if rs else None,
+        "r_total": sum(rs) if rs else None,
+        "profit_factor": gains / losses if losses else (None if not gains else float("inf")),
+        "drawdown_max_r": _drawdown(curve) if curve else None,
+        "courbe": [(p[1].closed_at, v) for p, v in zip(ordered, curve)],
+    }
+
+
 def statistics(pairs: list[tuple[Record, Outcome]]) -> dict:
-    """Taux de réussite du chef de desk et de chaque analyste."""
-    closed = [(r, o) for r, o in pairs if o.status in ("gagnant", "perdant", "expiré")]
-    wins = sum(1 for _, o in closed if o.status == "gagnant")
-    losses = sum(1 for _, o in closed if o.status == "perdant")
-    rs = [o.r_multiple for _, o in closed if o.r_multiple is not None]
+    stats = _trade_stats(pairs)
+    stats["decisions"] = len(pairs)
+    stats["en_cours"] = sum(1 for _, o in pairs if o.status == "en cours")
+    stats["non_declenches"] = sum(1 for _, o in pairs if o.status == "non déclenché")
+    stats["ambigus"] = sum(1 for _, o in pairs if o.ambiguities)
+    # Compatibilité avec l'ancien affichage.
+    stats["gagnants"], stats["perdants"] = stats["objectifs"], stats["stops"]
+    stats["taux_reussite"] = stats["taux_objectif"]
 
     # Justesse directionnelle : sur les fenêtres terminées, le signal allait-il dans le
     # sens du marché ? Les signaux neutres ne sont pas comptés.
@@ -229,17 +347,24 @@ def statistics(pairs: list[tuple[Record, Outcome]]) -> dict:
         for name, direction in votes.items():
             if direction in ("HAUSSIER", "BAISSIER"):
                 agents.setdefault(name, []).append((direction == "HAUSSIER") == up)
-
-    return {
-        "decisions": len(pairs),
-        "trades_clotures": len(closed),
-        "gagnants": wins,
-        "perdants": losses,
-        "taux_reussite": wins / (wins + losses) * 100 if wins + losses else None,
-        "r_moyen": sum(rs) / len(rs) if rs else None,
-        "r_total": sum(rs) if rs else None,
-        "justesse_agents": {
-            name: {"signaux": len(v), "justes": sum(v), "taux": sum(v) / len(v) * 100}
-            for name, v in sorted(agents.items())
-        },
+    stats["justesse_agents"] = {
+        name: {"signaux": len(v), "justes": sum(v), "taux": sum(v) / len(v) * 100}
+        for name, v in sorted(agents.items())
     }
+
+    # Ventilation par actif, style et mode.
+    for key, attr in (("par_actif", "asset"), ("par_style", "style"), ("par_mode", "mode")):
+        groups: dict[str, list] = {}
+        for r, o in pairs:
+            groups.setdefault(getattr(r, attr), []).append((r, o))
+        stats[key] = {k: _trade_stats(v) for k, v in sorted(groups.items())}
+
+    # Calibration : la confiance annoncée correspond-elle aux résultats ?
+    buckets = (("< 50 %", 0, 50), ("50-64 %", 50, 65), ("65-79 %", 65, 80), ("≥ 80 %", 80, 101))
+    stats["calibration"] = {}
+    for label, lo, hi in buckets:
+        sel = [(r, o) for r, o in pairs if lo <= (r.confidence or 0) < hi]
+        ts = _trade_stats(sel)
+        if ts["trades_clotures"]:
+            stats["calibration"][label] = ts
+    return stats

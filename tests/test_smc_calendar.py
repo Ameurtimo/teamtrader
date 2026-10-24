@@ -11,7 +11,7 @@ import pytest
 from teamtrader import agents, data, economic_calendar, history, pipeline, smc
 from teamtrader.config import ASSETS
 
-from test_teamtrader import FakeClient, make_ohlcv, text
+from test_teamtrader import FakeClient, good_reports, make_ohlcv, text
 
 
 def path(points: list[tuple[float, int]]) -> pd.DataFrame:
@@ -89,6 +89,26 @@ def test_bearish_mirror():
     assert s.targets[0] < s.entry < s.stop
 
 
+def test_all_targets_are_beyond_entry_on_random_markets():
+    """Régression : l'objectif 2 pouvait être pris du mauvais côté (liquidité opposée)."""
+    for seed in range(300):
+        rng = np.random.default_rng(seed)
+        n = int(rng.integers(150, 600))
+        c = 1000 + np.cumsum(rng.normal(rng.normal(0, 1), rng.uniform(1, 8), n))
+        o = np.r_[c[0], c[:-1]]
+        w = np.abs(rng.normal(2, 1, n))
+        df = pd.DataFrame({"Open": o, "High": np.maximum(o, c) + w, "Low": np.minimum(o, c) - w,
+                           "Close": c, "Volume": 0},
+                          index=pd.date_range("2026-01-01", periods=n, freq="15min", tz="UTC"))
+        s = smc.analyze(df, "15m").setup
+        if s.entry is None:
+            continue
+        bull = s.direction == "haussier"
+        assert (s.stop < s.entry) if bull else (s.stop > s.entry), seed
+        assert all((t > s.entry) if bull else (t < s.entry) for t in s.targets), seed
+        assert s.targets == sorted(s.targets, reverse=not bull), seed
+
+
 def test_format_map_mentions_rule():
     txt = smc.format_map(smc.analyze(path(BULL_LEG + [(124, 4)]), "1h"))
     assert "Entrée autorisée par la règle d'inducement : NON" in txt
@@ -128,10 +148,12 @@ def test_decide_in_smc_mode_enforces_rule_and_sends_rule_to_model():
     m = smc.analyze(df, "1h")
     ctx = pipeline.Context(asset=ASSETS["XAUUSD"], style="swing", frames={"1h": df},
                            price=124.0, technical="tech", macro="", smc_map=m,
-                           calendar="| NFP |")
+                           calendar="| NFP |", smc_mode=True)
     client = FakeClient([NS(stop_reason="end_turn", parsed_output=decision(), content=[])])
-    d = pipeline.decide(client, ctx, [], calendar_forecast="NFP au-dessus")
-    assert d.decision == "ATTENDRE"
+    result = pipeline.decide(client, ctx, good_reports() + good_reports(("smc",)),
+                             calendar_forecast="NFP au-dessus")
+    assert result.decision.decision == "ATTENDRE" and result.status == "bloquée"
+    assert "inducement" in result.blocked_by[0]
     prompt = client.calls[0]["messages"][0]["content"]
     assert "MODE SMART MONEY CONCEPTS" in prompt and "Inducement : 121.20" in prompt
     assert "| NFP |" in prompt and "NFP au-dessus" in prompt

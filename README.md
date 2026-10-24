@@ -25,24 +25,33 @@ construite comme une équipe d'agents IA (Claude) :
          (mode SMC : pas d'entrée sans inducement balayé)
          entrée, stop-loss, objectifs, confiance, invalidation
                                   ▼
-                   📒 Historique : chaque décision est rejouée
-                   sur les prix qui ont suivi → fiabilité mesurée
+          ✅ Contrôles automatiques (niveaux cohérents, R/R ≥ 1,5, qualité des données)
+                                  ▼
+          📐 Taille de position avec coûts, marge, levier et limites du compte
+                                  ▼
+          💼 Paper trading  ·  📒 Historique rejoué et figé → performance mesurée
 ```
 
 - Chaque spécialiste rédige un rapport et termine par un **signal** (haussier / baissier / neutre + confiance).
 - Le chef de desk pondère les avis selon l'horizon choisi et renvoie une **décision structurée**
   (validée par un schéma Pydantic), avec les arguments pour/contre et les conditions d'invalidation.
-- L'application calcule la **taille de position** à partir de ton capital et du % de risque par trade.
+- La décision passe des **contrôles déterministes** avant d'être affichée ou enregistrée (voir
+  plus bas) ; une décision invalide est renvoyée une fois au chef de desk, puis rejetée.
+- La **taille de position** tient compte du profil de ton broker (taille du contrat, lots,
+  spread, commission, glissement, financement, marge) et des limites du compte (levier, risque
+  cumulé, perte journalière maximale).
+- **💼 Paper trading** : un portefeuille fictif structuré, avec exécutions simulées et coûts.
 - **🎯 Mode Smart Money Concepts** (option) : structure BOS / CHoCH, order blocks, fair value
   gaps, liquidité, premium / discount et **inducement**. Règle stricte : **une entrée n'est
   validée qu'après le balayage de l'inducement** (voir plus bas).
 - **📅 Calendrier US + prévisions** : les publications américaines de la semaine (CPI, NFP,
   Fed…) avec, pour chacune, une prévision IA **avant la sortie du chiffre** (au-dessus / en
   dessous / conforme au consensus) et la réaction attendue de l'or, du bitcoin et du dollar.
-- L'onglet **Historique et fiabilité** enregistre chaque décision, vérifie ensuite si l'objectif
-  ou le stop a été touché en premier, et calcule le **taux de réussite**, le **gain moyen en R**
-  et le **taux de justesse de chaque agent**. Au bout de quelques dizaines de décisions, tu
-  sauras quels agents écouter.
+- L'onglet **Historique et performance** rejoue chaque décision de façon reproductible et
+  affiche la courbe de résultats, le drawdown, le profit factor, les résultats par actif, style
+  et mode, la **calibration de la confiance** et la **justesse de chaque agent**. Chaque
+  analyse peut être rouverte (rapports, sources, paramètres, modèle, qualité des données).
+- **💰 Coûts IA** : coût estimé de chaque analyse, dépense du mois et budget maximal.
 
 ## Installation
 
@@ -93,9 +102,66 @@ puis clique sur **Lancer l'analyse**. Une analyse prend en général 1 à 3 minu
 python -m teamtrader XAUUSD --style swing
 python -m teamtrader BTCUSD --style intraday -v     # -v affiche les rapports complets
 python -m teamtrader XAUUSD --style intraday --smc  # mode Smart Money Concepts
+python -m teamtrader BTCUSD --paper                 # ouvre aussi l'ordre en paper trading
 ```
 
 Les décisions prises en ligne de commande sont aussi ajoutées à l'historique.
+
+## ✅ Contrôles des décisions
+
+Les règles sont écrites dans le prompt du chef de desk, **et imposées par le code**
+(`teamtrader/validation.py`) :
+
+- confiance et poids des agents compris entre 0 et 100 ;
+- prix positifs et finis ;
+- pour un ACHAT ou une VENTE : entrée, stop et au moins un objectif obligatoires ;
+- achat : stop < entrée < objectifs ; vente : l'inverse ; objectifs ordonnés ;
+- entrée à moins de 10 % du prix actuel ;
+- ratio risque / rendement **signé** sur l'objectif 1 d'au moins 1,5 (un objectif du mauvais
+  côté donne un ratio négatif, donc refusé).
+
+Une décision qui échoue est renvoyée **une fois** au chef de desk avec la liste des erreurs.
+Si elle échoue encore, elle devient **ATTENDRE sans niveaux** (« rejetée »). Le statut des
+contrôles (valide, corrigée, rejetée, bloquée) est affiché et enregistré.
+
+**Seuil de qualité** (`teamtrader/quality.py`) : chaque donnée a une date, une source et un
+statut (ok, périmée, indisponible). Si le prix est périmé ou absent, si le rapport technique
+manque, ou s'il y a moins de 3 rapports exploitables sur 4 (ou pas de rapport SMC en mode
+SMC), la décision est **ATTENDRE** sans même appeler le chef de desk.
+
+Sources structurées ajoutées : funding et open interest du perpétuel BTC (OKX, sinon
+Binance), position nette des spéculateurs sur l'or (rapport COT de la CFTC), en plus du
+Fear & Greed et du calendrier. Les flux ETF restent recherchés sur le web (pas de source
+gratuite fiable).
+
+## 💼 Gestion du risque et paper trading
+
+Onglet **Paper trading → Compte, limites de risque et profil broker** :
+
+| Réglage | Défaut | Rôle |
+|---|---|---|
+| Capital de départ | 10 000 $ | Fonds propres du compte fictif |
+| Risque par trade | 1 % | Perte maximale si le stop est touché, **coûts compris** |
+| Levier max | ×10 | Nominal total des positions / fonds propres |
+| Risque cumulé max | 3 % | Somme des risques des positions ouvertes |
+| Perte journalière max | 3 % | Au-delà : aucune nouvelle prise de risque ce jour-là |
+
+Profil broker par actif : taille du contrat (or : 100 oz / lot, BTC : 1 BTC / lot), lot minimum
+et pas, spread, glissement, commission (par lot ou en %), financement long / court, marge.
+**Les valeurs par défaut sont des ordres de grandeur : remplace-les par celles de ton broker.**
+
+Depuis une décision, le bouton **Ouvrir en paper trading** crée un ordre fictif (entrée, stop,
+objectif 1, échéance du style). Il est exécuté sur les vraies bougies qui suivent, avec le même
+moteur que l'historique, puis valorisé net de spread, commission, glissement (sorties au stop ou
+au marché) et financement. Les positions ouvertes sont transmises aux agents et au chef de desk.
+
+## 💰 Coûts IA
+
+Chaque appel enregistre ses tokens, ses recherches web et un coût estimé (tableau de prix dans
+`teamtrader/costs.py`, à vérifier sur la page de tarifs d'Anthropic). Le coût de chaque analyse
+est affiché ; l'onglet Historique résume la dépense par mois et par type d'appel.
+`TEAMTRADER_MONTHLY_BUDGET_USD` fixe un budget mensuel : une fois atteint, les analyses sont
+bloquées.
 
 ## 🎯 Mode Smart Money Concepts
 
@@ -200,7 +266,8 @@ en Next.js) et stocker l'historique dans une vraie base de données.
 4. **Deploy**. L'adresse ressemble à `https://teamtrader-xxx.streamlit.app`.
 
 ⚠️ Sur Streamlit Cloud, le disque est réinitialisé à chaque redémarrage de l'app : pense à
-**exporter l'historique en CSV** régulièrement (bouton dans l'onglet Historique).
+**télécharger une sauvegarde de la base** régulièrement (onglet Historique → Sauvegarde et
+restauration), et à la restaurer après un redémarrage.
 Render, Railway ou Fly.io conviennent aussi (commande de démarrage :
 `streamlit run app.py --server.port $PORT --server.address 0.0.0.0`) ; ils proposent un disque
 persistant pour conserver `teamtrader_history.db`.
@@ -218,23 +285,41 @@ persistant pour conserver `teamtrader_history.db`.
 | `TEAMTRADER_WEB_SEARCH_MAX_USES` | `6` | Recherches web maximum par agent |
 | `TEAMTRADER_DB` | `teamtrader_history.db` | Fichier SQLite de l'historique |
 | `TEAMTRADER_TZ` | `Europe/Paris` | Fuseau horaire d'affichage du calendrier |
+| `TEAMTRADER_MIN_RR` | `1.5` | Ratio risque / rendement minimal sur l'objectif 1 |
+| `TEAMTRADER_MAX_ENTRY_DISTANCE_PCT` | `10` | Distance maximale entre l'entrée et le prix actuel |
+| `TEAMTRADER_MONTHLY_BUDGET_USD` | `0` (illimité) | Budget IA mensuel ; au-delà, analyses bloquées |
+| `TEAMTRADER_LOG_LEVEL` | `INFO` | Niveau des journaux techniques |
+| `TEAMTRADER_LOG_FILE` | — | Fichier des journaux (sinon la console) |
 
 Le coût dépend surtout du nombre de recherches web et de l'effort : baisser l'effort des
 spécialistes à `low` ou réduire `TEAMTRADER_WEB_SEARCH_MAX_USES` rend chaque analyse moins chère.
 
-## Comment la fiabilité est mesurée
+## Comment la fiabilité est mesurée (méthode v2)
 
-- L'ordre est considéré **déclenché** quand une bougie 1h touche le prix d'entrée
-  (immédiatement si l'entrée est au prix du marché). Sans déclenchement avant la fin de
-  l'horizon : « non déclenché ».
-- Ensuite, on regarde si l'**objectif 1** ou le **stop** est touché en premier. Si une même
-  bougie touche les deux, on compte une **perte** (hypothèse prudente).
-- Si aucun des deux n'est touché à la fin de l'horizon (24 h en intraday, 10 jours en swing,
-  8 semaines en position), le trade est « expiré » et valorisé au dernier cours.
-- Les résultats sont exprimés en **R** : +2R = gain de deux fois le risque pris, −1R = stop touché.
+Le moteur de rejeu (`teamtrader/replay.py`) est commun à l'historique et au paper trading.
+
+- **Données** : bougies 15 min quand elles couvrent la période (sinon 1 h), de la **même source**
+  qu'au moment de la décision, avec le **même écart future/spot** pour l'or (enregistré avec la
+  décision) : un changement d'écart ultérieur ne modifie pas le résultat.
+- **Bougie de la décision** : prise en compte ; ce qui s'y passe est signalé comme ambigu
+  (une partie de son range peut précéder la décision).
+- **Bougies encore ouvertes** : ignorées.
+- **Couverture** : une période n'est terminée que si les données la couvrent vraiment, du début
+  (première bougie au plus tard à la décision, sauf marché fermé) jusqu'à l'échéance. Les trous
+  inattendus sont signalés (pas le week-end de l'or).
+- **Entrée** : immédiate si elle est au prix du marché, sinon quand une bougie touche le prix.
+- **Ambiguïtés, hypothèse prudente, toujours signalées** : stop et objectif dans la même bougie =
+  perte ; entrée et stop dans la même bougie = perte ; objectif touché dans la bougie d'entrée =
+  non compté.
+- **Résultats figés** : dès que la période est couverte, le résultat est enregistré avec les
+  bougies utilisées et la version de la méthode (🔒 dans le journal). Si la méthode change, le
+  résultat est recalculé à partir des bougies conservées, sans dépendre du fournisseur.
+- **Statistiques séparées** : objectifs atteints, stops touchés, échéances gagnantes et
+  perdantes, « objectif avant stop » et « trades gagnants » (échéances comprises), R moyen et
+  cumulé, profit factor, drawdown en R, ventilation par actif / style / mode, calibration de la
+  confiance (la confiance de 80 % gagne-t-elle plus souvent que celle de 50 %?).
 - **Justesse des agents** : sur les décisions dont l'horizon est écoulé, le signal
-  haussier/baissier de chaque agent allait-il dans le sens du marché ? Les signaux neutres
-  ne sont pas comptés.
+  haussier / baissier allait-il dans le sens du marché ? Les signaux neutres ne comptent pas.
 
 Il faut au moins 30 à 50 décisions pour que ces statistiques veuillent dire quelque chose.
 
@@ -246,25 +331,49 @@ Il faut au moins 30 à 50 décisions pour que ces statistiques veuillent dire qu
 | `teamtrader/data.py` | Prix (Twelve Data / Yahoo recalé sur le spot), macro, sentiment |
 | `teamtrader/indicators.py` | EMA, RSI, MACD, Bollinger, ATR, ADX, supports / résistances |
 | `teamtrader/agents.py` | Prompts des agents, appels à Claude, schéma de la décision |
-| `teamtrader/pipeline.py` | Orchestration, taille de position, risque / rendement |
-| `teamtrader/history.py` | Journal SQLite, rejeu des décisions, statistiques de fiabilité |
+| `teamtrader/pipeline.py` | Orchestration, contrôles, seuil de qualité, archivage d'une analyse |
+| `teamtrader/validation.py` | Contrôles déterministes des décisions, R/R signé |
+| `teamtrader/quality.py` | Fraîcheur et disponibilité des données, seuil de qualité |
+| `teamtrader/replay.py` | Moteur de rejeu (couverture, ambiguïtés, bougies ouvertes) |
+| `teamtrader/history.py` | Journal SQLite, résultats figés, performance et calibration |
+| `teamtrader/risk.py` | Profil broker, coûts, taille de position et limites du compte |
+| `teamtrader/paper.py` | Paper trading : positions fictives, exécutions et coûts |
+| `teamtrader/costs.py` | Consommation et coût des appels à Claude, budget mensuel |
+| `teamtrader/backup.py` | Sauvegarde / restauration de la base SQLite |
+| `teamtrader/logs.py` | Journaux techniques (durées, erreurs) |
 | `teamtrader/smc.py` | Détection Smart Money Concepts et setup avec inducement |
 | `teamtrader/economic_calendar.py` | Calendrier économique américain de la semaine |
 | `teamtrader/calendar_history.py` | Suivi et fiabilité des prévisions du calendrier |
 | `app.py` | Interface Streamlit |
-| `tests/` | Tests hors-ligne (données synthétiques, client Claude simulé) |
+| `tests/` | Tests hors ligne (données synthétiques, client Claude simulé, réseau bloqué) |
+| `tests/integration/` | Vérifications des vrais fournisseurs et de l'API Claude |
 
 Ajouter un agent : créer un `AgentSpec` dans `agents.py`, l'ajouter à `SPECIALISTS`, ajouter
 sa clé dans `AgentView.agent`, et lui préparer un briefing dans `Context.briefing`.
 
-Lancer les tests : `pytest -q`
+### Tests
+
+```bash
+pytest -q                     # tests unitaires, hors ligne (réseau bloqué volontairement)
+pytest -q -m integration      # vrais fournisseurs : Yahoo, gold-api, Forex Factory, OKX/Binance, CFTC…
+TEAMTRADER_TEST_CLAUDE=1 pytest -q -m integration   # + 2 petits appels à Claude (quelques centimes)
+```
+
+Les tests unitaires tournent automatiquement sur GitHub à chaque push et pull request
+(`.github/workflows/tests.yml`). Les tests d'intégration se lancent à la main depuis l'onglet
+**Actions → Tests → Run workflow** (case « integration »). Lance-les une première fois : ils
+confirment que les formats des API externes sont bien ceux attendus.
 
 ## Limites à connaître
 
 - Les données Yahoo peuvent avoir quelques minutes de retard ; le recalage du future de
-  l'or sur le spot utilise l'écart du moment, appliqué à tout l'historique.
-- Le rejeu des décisions travaille sur des bougies 1h : il ne voit pas l'ordre exact des
-  mouvements à l'intérieur d'une heure, ni le spread ou les frais de ton broker.
+  l'or sur le spot utilise l'écart du moment de la décision, appliqué à ses bougies.
+- Le rejeu ne voit pas l'ordre des mouvements à l'intérieur d'une bougie (15 min au mieux) :
+  ces cas sont signalés et tranchés de façon prudente.
+- Les coûts du paper trading viennent du profil broker que tu renseignes ; les coûts IA sont
+  des estimations.
+- La confiance annoncée par le chef de desk reste une appréciation du modèle : regarde la
+  table de calibration avant de t'y fier.
 - Les agents peuvent se tromper ou s'appuyer sur une information incomplète : lis les
   rapports détaillés et les sources avant d'agir.
 

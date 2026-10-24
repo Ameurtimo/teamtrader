@@ -7,7 +7,9 @@ sous forme structurée (validée par Pydantic).
 
 from __future__ import annotations
 
+import logging
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Literal, Optional
@@ -15,7 +17,9 @@ from typing import Literal, Optional
 import anthropic
 from pydantic import BaseModel, Field
 
-from . import config
+from . import config, costs
+
+log = logging.getLogger("teamtrader.agents")
 
 # Si un filtre de sécurité refuse une requête, l'API la relance automatiquement
 # sur le modèle de repli recommandé au lieu de renvoyer un refus.
@@ -232,6 +236,13 @@ class AgentReport:
     confidence: Optional[int] = None
     sources: list[dict] = field(default_factory=list)
     error: Optional[str] = None
+    model: str = ""
+    duration_s: float = 0.0
+    usage: list[dict] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.error and bool(self.text) and self.direction is not None
 
 
 _DIRECTION_RE = re.compile(r"Direction\s*:\s*\**\s*(HAUSSIER|BAISSIER|NEUTRE)", re.I)
@@ -263,6 +274,7 @@ def run_specialist(
     report = AgentReport(key=spec.key, name=spec.name, icon=spec.icon)
     messages: list[dict] = [{"role": "user", "content": briefing}]
     texts: list[str] = []
+    started = time.monotonic()
     try:
         for _ in range(MAX_CONTINUATIONS):
             with client.beta.messages.stream(
@@ -278,9 +290,11 @@ def run_specialist(
             ) as stream:
                 response = stream.get_final_message()
 
+            report.usage.append(costs.usage_of(response, spec.key))
+            report.model = str(getattr(response, "model", "") or "")
             if response.stop_reason == "refusal":
                 report.error = "La requête a été refusée par le modèle."
-                return report
+                return _done(report, started)
             _collect(response.content, texts, report.sources)
             # La recherche web tourne côté serveur ; si la boucle serveur atteint sa
             # limite, on renvoie la réponse telle quelle pour qu'elle reprenne.
@@ -289,13 +303,27 @@ def run_specialist(
             messages = [messages[0], {"role": "assistant", "content": response.content}]
     except anthropic.APIError as e:
         report.error = f"Erreur API : {e}"
-        return report
+        return _done(report, started)
 
     report.text = "".join(texts).strip()
     report.direction, report.confidence = parse_signal(report.text)
     # Dédoublonnage des sources en gardant l'ordre.
     seen: set[str] = set()
     report.sources = [s for s in report.sources if not (s["url"] in seen or seen.add(s["url"]))]
+    if not report.text:
+        report.error = "Rapport vide."
+    return _done(report, started)
+
+
+def _done(report: AgentReport, started: float) -> AgentReport:
+    report.duration_s = round(time.monotonic() - started, 1)
+    cost = costs.total(report.usage)["cost_usd"]
+    if report.error:
+        log.warning("Agent %s en échec après %.1fs : %s", report.key, report.duration_s,
+                    report.error)
+    else:
+        log.info("Agent %s terminé en %.1fs (%s, %.4f $)", report.key, report.duration_s,
+                 report.direction, cost)
     return report
 
 
@@ -380,8 +408,11 @@ def build_decision_prompt(
     return "\n".join(parts)
 
 
-def _structured(client, system: str, prompt: str, output_format, effort: str, model: str):
-    """Appel sans outil dont la réponse est validée par un modèle Pydantic."""
+def _structured(client, system: str, prompt: str, output_format, effort: str, model: str,
+                label: str = "structure"):
+    """Appel sans outil dont la réponse est validée par un modèle Pydantic.
+
+    Renvoie (objet validé, consommation)."""
     with client.beta.messages.stream(
         model=model,
         max_tokens=32000,
@@ -395,18 +426,19 @@ def _structured(client, system: str, prompt: str, output_format, effort: str, mo
     ) as stream:
         response = stream.get_final_message()
 
+    usage = costs.usage_of(response, label)
     if response.stop_reason == "refusal":
         raise RuntimeError("Le modèle a refusé la requête.")
     if response.stop_reason == "max_tokens" or response.parsed_output is None:
         raise RuntimeError("La réponse n'a pas pu être générée complètement, relance l'analyse.")
-    return response.parsed_output
+    return response.parsed_output, usage
 
 
 def run_decision(
     client: anthropic.Anthropic, prompt: str, model: str = config.MODEL
-) -> TradingDecision:
+) -> tuple[TradingDecision, dict]:
     return _structured(client, DECISION_SYSTEM, prompt, TradingDecision,
-                       config.DECISION_EFFORT, model)
+                       config.DECISION_EFFORT, model, label="decision")
 
 
 # --------------------------------------------------------------------------- calendrier
@@ -462,8 +494,9 @@ def forecast_calendar(
     report = run_specialist(client, CALENDAR, briefing, model)
     if report.error or not report.text:
         return None, report
-    forecast = _structured(client, CALENDAR_EXTRACT_SYSTEM, report.text, CalendarForecast,
-                           "low", model)
+    forecast, usage = _structured(client, CALENDAR_EXTRACT_SYSTEM, report.text,
+                                  CalendarForecast, "low", model, label="calendrier-format")
+    report.usage.append(usage)
     return forecast, report
 
 
@@ -502,7 +535,9 @@ def fetch_actuals(
     report = run_specialist(client, ACTUALS, f"Publications à vérifier :\n{lines}", model)
     if report.error or not report.text:
         return {}, report
-    parsed = _structured(client, "Tu convertis cette note en données structurées, sans rien "
-                         "inventer.", report.text, ActualValues, "low", model)
+    parsed, usage = _structured(client, "Tu convertis cette note en données structurées, sans "
+                                "rien inventer.", report.text, ActualValues, "low", model,
+                                label="verificateur-format")
+    report.usage.append(usage)
     known = {i["id"] for i in items}
     return {r.id: r.publie.strip() for r in parsed.resultats if r.id in known}, report

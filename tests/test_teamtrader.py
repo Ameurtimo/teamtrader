@@ -78,11 +78,7 @@ def test_parse_signal(text, expected):
     assert agents.parse_signal(text) == expected
 
 
-def test_position_size_and_risk_reward():
-    s = pipeline.position_size(10_000, 1.0, entry=2000, stop=1980)
-    assert s["montant_risque"] == 100
-    assert s["unites"] == pytest.approx(5.0)
-    assert pipeline.position_size(10_000, 1.0, entry=2000, stop=None) is None
+def test_risk_reward_alias():
     assert pipeline.risk_reward(2000, 1980, 2050) == pytest.approx(2.5)
 
 
@@ -102,6 +98,12 @@ class FakeClient:
         self.calls.append(kwargs)
         msg = self.responses.pop(0)
         yield NS(get_final_message=lambda: msg)
+
+
+def good_reports(keys=("fondamental", "technique", "geopolitique", "sentiment")):
+    """Rapports exploitables (texte + signal) pour passer le contrôle de qualité."""
+    return [agents.AgentReport(key=k, name=k, icon="", text="Analyse.", direction="HAUSSIER",
+                               confidence=60) for k in keys]
 
 
 def text(t):
@@ -173,7 +175,8 @@ def test_decide_returns_parsed_output():
         asset=ASSETS["XAUUSD"], style="swing", frames={"1h": h, "4h": data.resample(h, "4h")},
         price=float(h["Close"].iloc[-1]), technical="tech", macro="macro",
     )
-    assert pipeline.decide(client, ctx, []) is decision
+    result = pipeline.decide(client, ctx, good_reports())
+    assert result.decision is decision and result.status == "valide"
     assert client.calls[0]["output_format"] is agents.TradingDecision
 
 

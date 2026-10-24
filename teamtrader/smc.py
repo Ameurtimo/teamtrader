@@ -330,10 +330,14 @@ def find_setup(
     else:
         setup.stop = max(poi.top + buffer, setup.entry + min_risk)
     setup.targets = [leg_end]
-    pools = sorted(l.price for l in liquidity if (l.kind == "égaux hauts" and l.price > leg_end)
-                   or (l.kind == "égaux bas" and l.price < leg_end))
+    # Objectif 2 : la liquidité suivante DANS LE SENS du trade (égaux hauts au-dessus de la
+    # jambe pour un achat, égaux bas en dessous pour une vente).
+    if bull:
+        pools = [l.price for l in liquidity if l.kind == "égaux hauts" and l.price > leg_end]
+    else:
+        pools = [l.price for l in liquidity if l.kind == "égaux bas" and l.price < leg_end]
     if pools:
-        setup.targets.append(pools[0] if bull else pools[-1])
+        setup.targets.append(min(pools) if bull else max(pools))
 
     if not setup.idm_swept:
         setup.status = "en attente : inducement non balayé"
