@@ -413,7 +413,8 @@ def run_decision(
 
 
 class EventForecast(BaseModel):
-    evenement: str
+    evenement: str = Field(description="Nom exact de la publication, tel qu'écrit dans le "
+                                       "calendrier fourni (en anglais)")
     date_heure_utc: str = Field(description="Format AAAA-MM-JJ HH:MM")
     importance: Literal["forte", "moyenne"]
     precedent: str
@@ -438,19 +439,70 @@ class CalendarForecast(BaseModel):
 
 CALENDAR_EXTRACT_SYSTEM = """Tu convertis la note d'un économiste en données structurées. \
 Reprends fidèlement ses prévisions, probabilités et raisonnements, sans en inventer. \
-Une ligne par publication analysée, dans l'ordre chronologique. Réponds en français."""
+Une ligne par publication analysée, dans l'ordre chronologique. Garde le nom anglais \
+exact et l'heure UTC de chaque publication tels qu'ils figurent dans le calendrier. \
+Réponds en français pour le reste."""
 
 
 def forecast_calendar(
-    client: anthropic.Anthropic, calendar_text: str, model: str = config.MODEL
+    client: anthropic.Anthropic, calendar_text: str, model: str = config.MODEL,
+    track_record: str = "",
 ) -> tuple[Optional[CalendarForecast], AgentReport]:
-    """Étape 1 : recherche (web) et prévisions rédigées. Étape 2 : mise en forme validée."""
+    """Étape 1 : recherche (web) et prévisions rédigées. Étape 2 : mise en forme validée.
+
+    `track_record` résume la fiabilité mesurée des prévisions passées, pour que
+    l'économiste calibre ses probabilités.
+    """
     now = datetime.now(timezone.utc).strftime("%A %d %B %Y, %H:%M UTC")
     briefing = (f"Date et heure : {now}\n\n## Calendrier américain de la semaine\n\n"
-                f"{calendar_text}\n\nRédige tes prévisions.")
+                f"{calendar_text}\n\n")
+    if track_record:
+        briefing += f"## Ta fiabilité mesurée sur tes prévisions passées\n\n{track_record}\n\n"
+    briefing += "Rédige tes prévisions."
     report = run_specialist(client, CALENDAR, briefing, model)
     if report.error or not report.text:
         return None, report
     forecast = _structured(client, CALENDAR_EXTRACT_SYSTEM, report.text, CalendarForecast,
                            "low", model)
     return forecast, report
+
+
+# --------------------------------------------------------------------------- chiffres publiés
+
+ACTUALS = AgentSpec(
+    key="verificateur",
+    name="Vérificateur des chiffres publiés",
+    icon="🔎",
+    web_search=True,
+    system="""Tu retrouves les chiffres officiellement publiés pour des statistiques \
+économiques américaines déjà sorties. Pour chaque publication demandée, cherche sur le \
+web la valeur publiée (première estimation, celle annoncée le jour même, pas une \
+révision ultérieure), dans la même unité et le même format que le consensus indiqué. \
+Si tu ne trouves pas de source fiable, écris « introuvable » plutôt que de deviner. \
+Réponds en français, une ligne par publication, en reprenant son numéro.""",
+)
+
+
+class ActualValue(BaseModel):
+    id: int
+    publie: str = Field(description="Chiffre publié au même format que le consensus, "
+                                    "ou « introuvable »")
+
+
+class ActualValues(BaseModel):
+    resultats: list[ActualValue]
+
+
+def fetch_actuals(
+    client: anthropic.Anthropic, items: list[dict], model: str = config.MODEL
+) -> tuple[dict[int, str], AgentReport]:
+    """items : [{"id", "evenement", "date_heure_utc", "consensus"}] → {id: chiffre publié}."""
+    lines = "\n".join(f"{i['id']}. {i['evenement']} — publié le {i['date_heure_utc']} UTC — "
+                      f"consensus {i['consensus']}" for i in items)
+    report = run_specialist(client, ACTUALS, f"Publications à vérifier :\n{lines}", model)
+    if report.error or not report.text:
+        return {}, report
+    parsed = _structured(client, "Tu convertis cette note en données structurées, sans rien "
+                         "inventer.", report.text, ActualValues, "low", model)
+    known = {i["id"] for i in items}
+    return {r.id: r.publie.strip() for r in parsed.resultats if r.id in known}, report

@@ -154,6 +154,28 @@ Ces prévisions sont ensuite transmises au chef de desk lors des analyses, et le
 de la semaine est toujours fourni à l'analyste fondamental et au chef de desk (qui évite
 d'entrer juste avant une annonce majeure).
 
+### Fiabilité du prédicteur
+
+Chaque prévision est enregistrée automatiquement. Une fois la publication passée, le chiffre
+publié est récupéré :
+
+1. depuis le flux du calendrier quand il le fournit ;
+2. sinon avec le bouton **Récupérer les chiffres publiés manquants (IA)** (recherche web) ;
+3. ou en le saisissant toi-même dans la colonne **Chiffre publié** du tableau.
+
+L'application compare alors le chiffre au consensus (à la précision du consensus : 0,3 % contre
+0,3 % = conforme) et affiche :
+
+- le **taux de prévisions justes** (un tirage au hasard ferait environ 33 %) ;
+- le taux quand l'économiste annonçait une **surprise** (hors « conforme ») ;
+- la **calibration** : quand il annonce 65 %, a-t-il raison 65 % du temps ?
+- la justesse de la **réaction annoncée de l'or et du BTC** dans l'heure suivant la publication
+  (variation de moins de 0,10 % pour l'or et 0,25 % pour le BTC = neutre).
+
+Si une publication a été prévue plusieurs fois, seule la dernière prévision faite **avant**
+sa sortie compte. À partir de 5 prévisions vérifiées, ce bilan est transmis à l'économiste
+pour qu'il ajuste ses probabilités.
+
 ⚠️ Battre le consensus est difficile : considère ces prévisions comme un éclairage, pas comme
 une certitude. L'économiste a pour consigne de ne pas dépasser 65-70 % de probabilité sans
 indices très nets.
@@ -228,6 +250,7 @@ Il faut au moins 30 à 50 décisions pour que ces statistiques veuillent dire qu
 | `teamtrader/history.py` | Journal SQLite, rejeu des décisions, statistiques de fiabilité |
 | `teamtrader/smc.py` | Détection Smart Money Concepts et setup avec inducement |
 | `teamtrader/economic_calendar.py` | Calendrier économique américain de la semaine |
+| `teamtrader/calendar_history.py` | Suivi et fiabilité des prévisions du calendrier |
 | `app.py` | Interface Streamlit |
 | `tests/` | Tests hors-ligne (données synthétiques, client Claude simulé) |
 

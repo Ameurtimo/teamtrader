@@ -28,7 +28,8 @@ def _load_secrets() -> None:
 _load_secrets()
 
 from teamtrader import (  # noqa: E402
-    agents, config, data, economic_calendar, history, indicators, pipeline, smc,
+    agents, calendar_history, config, data, economic_calendar, history, indicators, pipeline,
+    smc,
 )
 from teamtrader.config import ASSETS, TRADING_STYLES  # noqa: E402
 
@@ -222,10 +223,17 @@ def render_calendar(api_key: str):
             with st.spinner("L'économiste analyse les indicateurs avancés (1 à 3 minutes)…"):
                 try:
                     forecast, report = agents.forecast_calendar(
-                        anthropic.Anthropic(api_key=api_key), calendar_text)
+                        anthropic.Anthropic(api_key=api_key), calendar_text,
+                        track_record=predictor_track_record())
                 except Exception as e:
                     forecast, report = None, agents.AgentReport(
                         key="calendrier", name="", icon="", error=str(e))
+            if forecast is not None:
+                try:
+                    with calendar_history.connect() as con:
+                        calendar_history.save_forecast(con, forecast)
+                except Exception as e:
+                    st.warning(f"Prévisions non enregistrées pour le suivi : {e}")
             st.session_state["calendar"] = (datetime.now(), forecast, report)
 
     if "calendar" not in st.session_state:
@@ -265,6 +273,137 @@ def render_calendar(api_key: str):
     st.caption("Une prévision n'est pas une certitude : même les meilleurs économistes se "
                "trompent souvent sur l'écart au consensus. Le mouvement réel dépend aussi "
                "des révisions et du détail des chiffres.")
+
+
+# ------------------------------------------------------------------------------ fiabilité du prédicteur
+
+CHECK = {True: "✅", False: "❌", None: "—"}
+
+
+def predictor_track_record() -> str:
+    try:
+        con = calendar_history.connect()
+        evals = calendar_history.evaluate(calendar_history.load(con), {})
+    except Exception:
+        return ""
+    return calendar_history.track_record_text(calendar_history.statistics(evals))
+
+
+def reaction_candles(rows: list[calendar_history.ForecastRow]) -> dict[str, pd.DataFrame]:
+    times = [r.event_time for r in rows if r.released]
+    if not times:
+        return {}
+    start = (min(times) - timedelta(hours=2)).replace(minute=0, second=0, microsecond=0)
+    out = {}
+    for key in ASSETS:
+        try:
+            out[key] = candles_since(key, start.isoformat())
+        except Exception:
+            pass  # la réaction de cet actif ne sera simplement pas évaluée
+    return out
+
+
+def render_forecast_tracking(api_key: str):
+    st.divider()
+    st.subheader("📊 Fiabilité du prédicteur")
+    con = calendar_history.connect()
+    rows = calendar_history.load(con)
+    if not rows:
+        st.info("Les prévisions sont enregistrées automatiquement. Une fois les chiffres "
+                "publiés, leur fiabilité apparaîtra ici.")
+        return
+
+    # 1. Chiffres publiés disponibles dans le flux du calendrier : remplis automatiquement.
+    events, _ = calendar_events()
+    for row_id, value in calendar_history.match_feed_actuals(rows, events).items():
+        calendar_history.set_actual(con, row_id, value, "calendrier")
+    rows = calendar_history.load(con)
+
+    # 2. Sinon, recherche IA (ou saisie manuelle dans le tableau).
+    pending = calendar_history.pending_actuals(rows)
+    if pending:
+        c = st.columns([2, 3])
+        if c[0].button(f"🔎 Récupérer les {len(pending)} chiffres publiés manquants (IA)"):
+            if not api_key:
+                st.error("Renseigne ta clé API Anthropic.")
+            else:
+                items = [{"id": r.id, "evenement": r.event,
+                          "date_heure_utc": f"{r.event_time:%Y-%m-%d %H:%M}",
+                          "consensus": r.consensus} for r in pending]
+                with st.spinner("Recherche des chiffres publiés…"):
+                    try:
+                        found, _ = agents.fetch_actuals(anthropic.Anthropic(api_key=api_key), items)
+                    except Exception as e:
+                        found = {}
+                        st.error(f"Recherche impossible : {e}")
+                saved = 0
+                for row_id, value in found.items():
+                    if value and value.lower() != "introuvable":
+                        calendar_history.set_actual(con, row_id, value, "IA (recherche web)")
+                        saved += 1
+                st.success(f"{saved} chiffre(s) retrouvé(s).")
+                rows = calendar_history.load(con)
+        c[1].caption("Tu peux aussi saisir le chiffre publié directement dans le tableau "
+                     "ci-dessous (colonne « Chiffre publié »).")
+
+    evals = calendar_history.evaluate(rows, reaction_candles(rows))
+    stats = calendar_history.statistics(evals)
+
+    def rate(r):
+        return f"{r['taux']:.0f}%" if r else "—"
+
+    def label(name, r):
+        return f"{name} ({r['justes']}/{r['n']})" if r else name
+
+    m = st.columns(4)
+    m[0].metric(label("Prévisions justes", stats["prevision"]), rate(stats["prevision"]),
+                help="Au-dessus / en dessous / conforme au consensus. "
+                "Un tirage au hasard ferait environ 33 %.")
+    m[1].metric(label("Hors « conforme »", stats["prevision_hors_conforme"]),
+                rate(stats["prevision_hors_conforme"]),
+                help="Seulement quand l'économiste annonçait une surprise.")
+    m[2].metric(label("Réaction de l'or (1 h)", stats["reaction_or"]), rate(stats["reaction_or"]))
+    m[3].metric(label("Réaction du BTC (1 h)", stats["reaction_btc"]), rate(stats["reaction_btc"]))
+
+    calib = [{"Probabilité annoncée": k, "Prévisions": v["n"], "Taux de réussite": rate(v)}
+             for k, v in stats["par_probabilite"].items() if v]
+    if calib:
+        st.caption("Calibration : quand l'économiste annonce 65 %, a-t-il raison 65 % du temps ?")
+        st.dataframe(calib, hide_index=True)
+
+    table = pd.DataFrame([
+        {
+            "id": e.row.id,
+            "Date": economic_calendar.local_time(e.row.event_time, config.DISPLAY_TZ)
+                    if e.row.event_time else "—",
+            "Publication": e.row.event,
+            "Consensus": e.row.consensus,
+            "Prévision": ARROW.get(e.row.prediction, e.row.prediction),
+            "Proba": f"{e.row.probability}%" if e.row.probability is not None else "—",
+            "Chiffre publié": e.row.actual or "",
+            "Résultat": ARROW.get(e.outcome, "—") if e.outcome else "—",
+            "Juste ?": CHECK[e.correct],
+            "Or 1 h": fmt(e.gold_move, "{:+.2f}%") + " " + CHECK[e.gold_ok],
+            "BTC 1 h": fmt(e.btc_move, "{:+.2f}%") + " " + CHECK[e.btc_ok],
+        }
+        for e in evals
+    ])
+    edited = st.data_editor(
+        table, hide_index=True, width="stretch", key="forecast_editor",
+        column_config={"id": None},
+        disabled=[c for c in table.columns if c != "Chiffre publié"],
+    )
+    changes = [(int(row["id"]), str(row["Chiffre publié"] or ""))
+               for (_, row), (_, before) in zip(edited.iterrows(), table.iterrows())
+               if (row["Chiffre publié"] or "") != (before["Chiffre publié"] or "")]
+    if changes:
+        for row_id, value in changes:
+            calendar_history.set_actual(con, row_id, value, "manuel")
+        st.rerun()
+    st.caption("Si une publication a été prévue plusieurs fois, seule la dernière prévision "
+               "faite avant sa sortie compte. La réaction est mesurée entre l'ouverture de la "
+               "bougie 1 h de la publication et sa clôture (variation sous 0,10 % pour l'or et "
+               "0,25 % pour le BTC = neutre).")
 
 
 def render_report(r: agents.AgentReport):
@@ -581,6 +720,7 @@ with tab_analysis:
 
 with tab_calendar:
     render_calendar(api_key)
+    render_forecast_tracking(api_key)
 
 with tab_smc:
     render_smc_scanner(asset_key, style)

@@ -31,6 +31,7 @@ class EconomicEvent:
     impact: str  # forte | moyenne | faible
     forecast: str
     previous: str
+    actual: str = ""  # renseigné par le flux une fois le chiffre publié
 
 
 def parse_events(raw: list[dict], impacts: tuple[str, ...] = ("High", "Medium")) -> list[EconomicEvent]:
@@ -48,6 +49,7 @@ def parse_events(raw: list[dict], impacts: tuple[str, ...] = ("High", "Medium"))
             impact=IMPACT_FR.get(e["impact"], e["impact"]),
             forecast=str(e.get("forecast") or "").strip() or "n/d",
             previous=str(e.get("previous") or "").strip() or "n/d",
+            actual=str(e.get("actual") or "").strip(),
         ))
     return sorted(out, key=lambda ev: ev.time)
 
